@@ -1,0 +1,61 @@
+function sendEmailUsingServiceAccount() {
+  var serviceAccountEmail = 'your-service-account@your-project-id.iam.gserviceaccount.com';
+  var userToImpersonate = 'user@example.com';  // The email of the user you're impersonating
+  var privateKey = `-----BEGIN PRIVATE KEY-----
+  YOUR_PRIVATE_KEY_HERE
+  -----END PRIVATE KEY-----`;
+
+  // Generate JWT for domain-wide delegation
+  var jwt = {
+    "iss": serviceAccountEmail,
+    "sub": userToImpersonate,
+    "scope": "https://www.googleapis.com/auth/gmail.send",
+    "aud": "https://oauth2.googleapis.com/token",
+    "exp": Math.floor((Date.now() / 1000) + 3600), // Token valid for 1 hour
+    "iat": Math.floor(Date.now() / 1000)
+  };
+
+  var jwtHeader = Utilities.base64Encode(JSON.stringify({"alg":"RS256","typ":"JWT"}));
+  var jwtPayload = Utilities.base64Encode(JSON.stringify(jwt));
+  var signature = Utilities.computeRsaSha256Signature(jwtHeader + "." + jwtPayload, privateKey);
+  var jwtToken = jwtHeader + "." + jwtPayload + "." + Utilities.base64Encode(signature);
+
+  // Exchange JWT for an OAuth2 token
+  var options = {
+    "method": "post",
+    "payload": {
+      "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      "assertion": jwtToken
+    }
+  };
+
+  var response = UrlFetchApp.fetch("https://oauth2.googleapis.com/token", options);
+  var token = JSON.parse(response.getContentText()).access_token;
+
+  // Get evaluated HTML template
+  var htmlContent = getEvaluatedHtmlTemplate("John Doe");
+
+  // Send email using Gmail API
+  var emailOptions = {
+    "method": "post",
+    "headers": {
+      "Authorization": "Bearer " + token,
+      "Content-Type": "application/json"
+    },
+    "payload": JSON.stringify({
+      "raw": Utilities.base64EncodeWebSafe(
+        Utilities.newBlob(
+          "From: user@example.com\n" +
+          "To: recipient@example.com\n" +
+          "Subject: Test Email from Service Account\n" +
+          "MIME-Version: 1.0\n" +
+          "Content-Type: text/html; charset=UTF-8\n\n" +
+          htmlContent
+        ).getBytes()
+      )
+    })
+  };
+
+  var gmailResponse = UrlFetchApp.fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", emailOptions);
+  Logger.log(gmailResponse.getContentText());
+}
