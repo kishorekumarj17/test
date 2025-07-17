@@ -1,0 +1,40 @@
+import os
+import cv2
+import pytesseract
+from pdf2image import convert_from_path
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from PIL import Image
+
+# Set Tesseract path if not in PATH
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+def detect_orientation(image):
+    try:
+        osd = pytesseract.image_to_osd(image)
+        rotate_angle = int([line for line in osd.split("\n") if "Rotate" in line][0].split(":")[-1].strip())
+        return rotate_angle
+    except:
+        return 0
+
+def rotate_image_if_needed(image):
+    angle = detect_orientation(image)
+    if angle != 0:
+        return image.rotate(-angle, expand=True)
+    return image
+
+def correct_pdf_orientation(input_pdf_path, output_pdf_path):
+    pages = convert_from_path(input_pdf_path, dpi=300)
+    output_images = []
+
+    for i, img in enumerate(pages):
+        rotated = rotate_image_if_needed(img)
+        output_images.append(rotated.convert("RGB"))
+
+    # Save all images back to PDF
+    output_images[0].save(output_pdf_path, save_all=True, append_images=output_images[1:])
+
+# Example usage
+input_pdf = 'scanned_input.pdf'
+output_pdf = 'rotated_output.pdf'
+correct_pdf_orientation(input_pdf, output_pdf)
