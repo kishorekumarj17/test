@@ -38,3 +38,39 @@ def correct_pdf_orientation(input_pdf_path, output_pdf_path):
 input_pdf = 'scanned_input.pdf'
 output_pdf = 'rotated_output.pdf'
 correct_pdf_orientation(input_pdf, output_pdf)
+
+
+import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image
+import io
+
+def detect_orientation(image):
+    try:
+        osd = pytesseract.image_to_osd(image)
+        rotate_angle = int([line for line in osd.split("\n") if "Rotate" in line][0].split(":")[-1].strip())
+        return rotate_angle
+    except:
+        return 0
+
+def rotate_pdf_pages(input_pdf, output_pdf):
+    doc = fitz.open(input_pdf)
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+
+        # Render the page as a PNG image
+        pix = page.get_pixmap(dpi=200)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+
+        # Detect orientation
+        angle = detect_orientation(img)
+        if angle != 0:
+            # Rotate the actual PDF page
+            page.set_rotation((page.rotation - angle) % 360)
+
+    doc.save(output_pdf)
+    doc.close()
+
+# Example usage
+rotate_pdf_pages("scanned_input.pdf", "rotated_output.pdf")
