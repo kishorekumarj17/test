@@ -74,3 +74,54 @@ def rotate_pdf_pages(input_pdf, output_pdf):
 
 # Example usage
 rotate_pdf_pages("scanned_input.pdf", "rotated_output.pdf")
+
+
+import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image
+import io
+
+def detect_orientation(image):
+    try:
+        osd = pytesseract.image_to_osd(image)
+        rotate_angle = int([line for line in osd.split("\n") if "Rotate" in line][0].split(":")[-1].strip())
+        return rotate_angle
+    except Exception as e:
+        print("Orientation detection failed:", e)
+        return 0
+
+def fix_scanned_pdf(input_pdf, output_pdf):
+    doc = fitz.open(input_pdf)
+    new_doc = fitz.open()  # New PDF to store fixed pages
+
+    for i, page in enumerate(doc):
+        print(f"Processing page {i+1}/{len(doc)}...")
+        
+        # Render current page to image
+        pix = page.get_pixmap(dpi=200)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+
+        # Detect orientation
+        angle = detect_orientation(img)
+        print(f"Detected angle: {angle}°")
+
+        # Rotate image if needed
+        if angle != 0:
+            rotated_img = img.rotate(-angle, expand=True)
+        else:
+            rotated_img = img
+
+        # Convert back to PDF page
+        img_byte_arr = io.BytesIO()
+        rotated_img.save(img_byte_arr, format='PNG')
+        img_bytes = img_byte_arr.getvalue()
+
+        # Add image as a new PDF page
+        rect = fitz.Rect(0, 0, rotated_img.width, rotated_img.height)
+        new_page = new_doc.new_page(width=rect.width, height=rect.height)
+        new_page.insert_image(rect, stream=img_bytes)
+
+    new_doc.save(output_pdf)
+    new_doc.close()
+    doc.close()
+    print(f"\n✅ Final rotated PDF saved as: {output_pdf}")
