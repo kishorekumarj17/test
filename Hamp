@@ -1,0 +1,22 @@
+@Injectable({ providedIn: 'root' })
+export class StorageService {
+  private value$ = new BehaviorSubject<string | null>(null);
+
+  constructor() {
+    const val = localStorage.getItem('myKey');
+    this.value$.next(val); // preload from localStorage
+  }
+
+  setValue(value: string) {
+    localStorage.setItem('myKey', value);
+    this.value$.next(value);
+  }
+
+  getValue(): Observable<string | null> {
+    return this.value$.asObservable();
+  }
+
+  getSnapshot(): string | null {
+    return this.value$.getValue();
+  }
+}
