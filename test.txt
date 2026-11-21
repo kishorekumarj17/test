@@ -18,12 +18,15 @@ import os
 import signal
 import time
 import traceback
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from dotenv import load_dotenv
-from sqlalchemy import bindparam, create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy import DateTime, Integer, String, Text, create_engine, func, select, update
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from job_worker.git_fetch import fetch_repo
 from orchestrator.run import RunRequest, run_main_agent
@@ -34,7 +37,6 @@ load_dotenv()
 # Must point at the SAME database the FastAPI app writes jobs to
 # (migration_skill_db). Use a sync driver URL, e.g. postgresql+psycopg2://...
 DB_URL = os.getenv("JOBS_DATABASE_URL") or os.environ["DATABASE_URL"]
-JOBS_TABLE = os.getenv("JOBS_TABLE", "jobs")
 POLL_SECONDS = int(os.getenv("WORKER_POLL_SECONDS", "5"))
 
 QUEUED_STATUSES = ("queued", "pending")
@@ -47,49 +49,73 @@ _stop = False
 ReportFn = Callable[..., None]
 
 
+# ---------------------------------------------------------------- model
+# Mirror of app/app/models/job.py (the API owns the table and its Alembic
+# migrations). Only map what the worker reads or writes. Never call
+# Base.metadata.create_all() here.
+class Base(DeclarativeBase):
+    pass
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    project_name: Mapped[str] = mapped_column(String(255))
+    repository_url: Mapped[str] = mapped_column(String(500))
+    branch: Mapped[str | None] = mapped_column(String(500))
+    local_repo_path: Mapped[str | None] = mapped_column(String(500))
+    output_path: Mapped[str | None] = mapped_column(String(500))
+    description: Mapped[str | None] = mapped_column(Text)
+    progress_percentage: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(50))
+    job_type: Mapped[str | None] = mapped_column(String(50))
+    user_query: Mapped[str | None] = mapped_column(Text)
+    progress_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
 # ---------------------------------------------------------------- db helpers
-def make_engine() -> Engine:
-    url = DB_URL.replace("+asyncpg", "+psycopg2")  # worker is sync
-    return create_engine(url, pool_pre_ping=True, pool_size=2, max_overflow=2)
+engine = create_engine(
+    DB_URL.replace("+asyncpg", "+psycopg2"),  # worker is sync
+    pool_pre_ping=True,
+    pool_size=2,
+    max_overflow=2,
+)
+# expire_on_commit=False: the claimed Job stays readable after the session closes
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
-def claim_next_job(engine: Engine) -> Optional[dict[str, Any]]:
+def claim_next_job() -> Optional[Job]:
     """Atomically take the oldest queued job and mark it running.
     SKIP LOCKED makes it safe to run more than one worker."""
-    sql = text(
-        f"""
-        UPDATE {JOBS_TABLE}
-           SET status = :running,
-               progress_percentage = 0,
-               progress_message = 'Picked up by worker',
-               updated_at = NOW()
-         WHERE id = (
-                SELECT id FROM {JOBS_TABLE}
-                 WHERE status IN :queued
-                 ORDER BY created_at ASC
-                 LIMIT 1
-                 FOR UPDATE SKIP LOCKED
-               )
-     RETURNING *
-        """
-    ).bindparams(bindparam("queued", expanding=True))
-
-    with engine.begin() as conn:
-        row = conn.execute(sql, {"running": RUNNING, "queued": list(QUEUED_STATUSES)}).mappings().first()
-        return dict(row) if row else None
+    with SessionLocal.begin() as session:
+        job = session.scalars(
+            select(Job)
+            .where(Job.status.in_(QUEUED_STATUSES))
+            .order_by(Job.created_at.asc())
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        ).first()
+        if job is None:
+            return None
+        job.status = RUNNING
+        job.progress_percentage = 0
+        job.progress_message = "Picked up by worker"
+        return job  # committed when the block exits
 
 
-def update_job(engine: Engine, job_id: Any, **fields: Any) -> None:
-    if not fields:
-        return
-    sets = ", ".join(f"{k} = :{k}" for k in fields)
-    sql = text(f"UPDATE {JOBS_TABLE} SET {sets}, updated_at = NOW() WHERE id = :id")
-    with engine.begin() as conn:
-        conn.execute(sql, {**fields, "id": job_id})
+def update_job(job_id: uuid.UUID, **fields: Any) -> None:
+    """Short transaction per update so the UI sees progress immediately."""
+    with SessionLocal.begin() as session:
+        session.execute(update(Job).where(Job.id == job_id).values(**fields))
 
 
 # ---------------------------------------------------------------- progress
-def make_reporter(engine: Engine, job_id: Any) -> ReportFn:
+def make_reporter(job_id: uuid.UUID) -> ReportFn:
     """Returns report(percent, message) or report(percent, stage, message).
 
     - percent is clamped to 0..100 and never goes backwards
@@ -103,7 +129,7 @@ def make_reporter(engine: Engine, job_id: Any) -> ReportFn:
         last["pct"] = pct
         log.info("job %s | %3d%% | %s%s", job_id, pct, f"[{stage}] " if stage else "", msg)
         try:
-            update_job(engine, job_id, progress_percentage=pct, progress_message=str(msg)[:2000])
+            update_job(job_id, progress_percentage=pct, progress_message=str(msg)[:2000])
         except Exception:  # never break the agent because of a progress write
             log.exception("could not write progress for job %s", job_id)
 
@@ -111,31 +137,31 @@ def make_reporter(engine: Engine, job_id: Any) -> ReportFn:
 
 
 # ---------------------------------------------------------------- job processing
-def build_query(job: dict[str, Any], repo_path: Path) -> str:
+def build_query(job: Job, repo_path: Path) -> str:
     query = f"create skills using this path {repo_path}"
-    if job.get("user_query"):
-        query += f". {job['user_query']}"
+    if job.user_query:
+        query += f". {job.user_query}"
     return query
 
 
-def process_job(engine: Engine, job: dict[str, Any]) -> None:
-    job_id = job["id"]
-    report = make_reporter(engine, job_id)
-    log.info("job %s claimed: %s", job_id, job.get("project_name"))
+def process_job(job: Job) -> None:
+    job_id = job.id
+    report = make_reporter(job_id)
+    log.info("job %s claimed: %s", job_id, job.project_name)
 
     try:
         # 1. source code
-        local = job.get("local_repo_path")
+        local = job.local_repo_path
         if local and Path(local).exists():
             repo_path = Path(local)
             report(10, "git", f"Using existing local repository {repo_path}")
         else:
-            repo_url = job["repository_url"]
-            branch = job.get("branch")
+            repo_url = job.repository_url
+            branch = job.branch
             if branch:
                 repo_url = f"{repo_url}#{branch}"  # git_fetch understands repo#branch
-            repo_path = fetch_repo(job["project_name"], repo_url, report)
-            update_job(engine, job_id, local_repo_path=str(repo_path))
+            repo_path = fetch_repo(job.project_name, repo_url, report)
+            update_job(job_id, local_repo_path=str(repo_path))
 
         # 2. main agent
         report(25, "agent", "Starting main agent")
@@ -148,7 +174,6 @@ def process_job(engine: Engine, job: dict[str, Any]) -> None:
 
         if agent_status in SUCCESS_AGENT_STATUSES:
             update_job(
-                engine,
                 job_id,
                 status=COMPLETED,
                 progress_percentage=100,
@@ -158,12 +183,12 @@ def process_job(engine: Engine, job: dict[str, Any]) -> None:
             log.info("job %s completed", job_id)
         else:
             reason = getattr(response, "message", None) or getattr(response, "error", None) or agent_status
-            update_job(engine, job_id, status=FAILED, progress_message=f"Agent stopped: {reason}"[:2000])
+            update_job(job_id, status=FAILED, progress_message=f"Agent stopped: {reason}"[:2000])
             log.warning("job %s failed: %s", job_id, reason)
 
     except Exception as exc:
         log.error("job %s crashed:\n%s", job_id, traceback.format_exc())
-        update_job(engine, job_id, status=FAILED, progress_message=f"Error: {exc}"[:2000])
+        update_job(job_id, status=FAILED, progress_message=f"Error: {exc}"[:2000])
 
 
 # ---------------------------------------------------------------- main loop
@@ -181,18 +206,17 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
 
-    engine = make_engine()
-    log.info("worker started, polling %s every %ss", JOBS_TABLE, POLL_SECONDS)
+    log.info("worker started, polling jobs every %ss", POLL_SECONDS)
 
     while not _stop:
         try:
-            job = claim_next_job(engine)
+            job = claim_next_job()
         except Exception:
             log.exception("could not poll for jobs")
             job = None
 
         if job:
-            process_job(engine, job)  # check again immediately after a job
+            process_job(job)  # check again immediately after a job
             continue
 
         for _ in range(POLL_SECONDS * 10):  # sleep, but react quickly to Ctrl+C
