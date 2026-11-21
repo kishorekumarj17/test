@@ -1,298 +1,196 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 // Keep your existing import paths for these two:
 import MainLayout from "../layouts/MainLayout";
 import WorkflowNav from "../components/WorkflowNav";
 import { Job, jobState } from "../hooks/useJobPolling";
-import "./AssessmentPage.css";
+import "./ApprovalPage.css";
 
 const API = import.meta.env.VITE_API_BASE_URL;
+const MAX = 2000;
 
-type FileEntry = {
-  path: string;
-  description?: string;
-  role_in_repository?: string;
-  key_behavior?: string[];
-  dependency_usage?: unknown[];
-  important_symbols?: { name: string; kind?: string; purpose?: string }[];
-  uncertainties?: unknown[];
+const EXAMPLES = [
+  "Upgrade React from 17 to 18 and fix breaking changes",
+  "Replace moment.js with date-fns",
+  "Migrate class components to function components with hooks",
+  "Upgrade all internal @org packages to their latest major version",
+];
+
+type JobWithPaths = Job & {
+  local_repo_path?: string | null;
+  output_path?: string | null;
 };
 
-type Tab = "skill" | "files";
-
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body?.detail ?? `Request failed (${res.status})`);
-  }
-  return res.json();
-}
-
-export const AssessmentPage: React.FC = () => {
+export const ApprovalPage: React.FC = () => {
   const navigate = useNavigate();
   const { migrationId } = useParams();
 
-  const [job, setJob] = useState<Job | null>(null);
-  const [skillMd, setSkillMd] = useState<string | null>(null);
-  const [files, setFiles] = useState<FileEntry[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [job, setJob] = useState<JobWithPaths | null>(null);
+  const [query, setQuery] = useState("");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
-  const [tab, setTab] = useState<Tab>("skill");
-  const [raw, setRaw] = useState(false);
-  const [filter, setFilter] = useState("");
-  const [reviewed, setReviewed] = useState(false);
-
-  // Job + skill on page load
   useEffect(() => {
     if (!migrationId) return;
     let cancelled = false;
-
-    (async () => {
-      try {
-        const j = await getJson<Job>(`${API}/jobs/${migrationId}`);
-        if (cancelled) return;
-        setJob(j);
-        if (jobState(j.status) !== "done") return;
-
-        const res = await fetch(`${API}/jobs/${migrationId}/artifacts/skill`);
-        if (!res.ok) throw new Error("Could not load the generated skill");
-        const text = await res.text();
-        if (!cancelled) setSkillMd(text);
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : "Something went wrong");
-      }
-    })();
-
+    fetch(`${API}/jobs/${migrationId}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`Could not load job (${r.status})`))))
+      .then((j) => !cancelled && setJob(j))
+      .catch((e) => !cancelled && setLoadError(e.message));
     return () => {
       cancelled = true;
     };
   }, [migrationId]);
 
-  // File analysis only when its tab is opened
-  useEffect(() => {
-    if (tab !== "files" || files || !migrationId) return;
-    getJson<Record<string, FileEntry>>(`${API}/jobs/${migrationId}/artifacts/file-analysis`)
-      .then((data) => setFiles(Object.values(data)))
-      .catch(() => setFiles([]));
-  }, [tab, files, migrationId]);
+  const ready = !!job && jobState(job.status) === "done" && !!job.local_repo_path;
+  const canSubmit = ready && query.trim().length >= 10 && !submitting;
 
-  const visibleFiles = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    if (!files) return [];
-    return q
-      ? files.filter(
-          (f) =>
-            f.path.toLowerCase().includes(q) ||
-            f.description?.toLowerCase().includes(q)
-        )
-      : files;
-  }, [files, filter]);
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!job || !canSubmit) return;
+    setSubmitting(true);
+    setSubmitError(null);
 
-  const downloadSkill = () => {
-    if (!skillMd) return;
-    const url = URL.createObjectURL(new Blob([skillMd], { type: "text/markdown" }));
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${job?.project_name ?? "repository"}_skill.md`;
-    a.click();
-    URL.revokeObjectURL(url);
+    try {
+      // New job = copy of the skill job + the change request, typed as "code"
+      const res = await fetch(`${API}/jobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_name: job.project_name,
+          repository_url: job.repository_url,
+          branch: job.branch || "main",
+          description: job.description ?? null,
+          local_repo_path: job.local_repo_path,
+          output_path: job.output_path ?? null,
+          job_type: "code",
+          user_query: query.trim(),
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(
+          typeof body?.detail === "string" ? body.detail : `Could not create the job (${res.status})`
+        );
+      }
+      const created: Job = await res.json();
+      navigate(`/migration/${created.id}/upgrade`);
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setSubmitting(false);
+    }
   };
-
-  const state = jobState(job?.status);
 
   return (
     <MainLayout
       title="Migration Skill Factory"
-      subtitle="Review the generated skill"
-      stepNumber={3}
+      subtitle="Describe the code change"
+      stepNumber={4}
       totalSteps={5}
-      workflow={<WorkflowNav currentStep="assessment" migrationId={migrationId} />}
+      workflow={<WorkflowNav currentStep="approval" migrationId={migrationId} disabled={submitting} />}
     >
-      <div className="as-wrap">
-        {error && <div className="as-alert">{error}</div>}
-        {!job && !error && <div className="as-empty">Loading…</div>}
+      <div className="ap-wrap">
+        {loadError && <div className="ap-alert">{loadError}</div>}
+        {!job && !loadError && <div className="ap-note">Loading…</div>}
 
-        {job && state !== "done" && (
-          <div className="as-empty">
-            This job is still <strong>{job.status}</strong>. Come back when the scan has finished.
-            <button className="as-btn is-secondary" onClick={() => navigate(`/migration/${job.id}/scan`)}>
+        {job && !ready && (
+          <div className="ap-note">
+            {jobState(job.status) !== "done"
+              ? "The skill job hasn't finished yet."
+              : "This job has no local repository path, so the coder agent has nothing to work on."}
+            <button className="ap-btn is-secondary" onClick={() => navigate(`/migration/${job.id}/scan`)}>
               Back to scan
             </button>
           </div>
         )}
 
-        {job && state === "done" && (
-          <>
-            {/* ---------- Summary ---------- */}
-            <section className="as-summary">
-              <div>
-                <span className="as-eyebrow">Assessment</span>
-                <h2>{job.project_name}</h2>
-                <p className="as-sub mono">
-                  {job.repository_url} @ {job.branch || "main"}
-                </p>
-              </div>
-              <div className="as-stats">
+        {job && ready && (
+          <section className="ap-card">
+            {/* Left: what the coder agent will use */}
+            <aside className="ap-context">
+              <span className="ap-eyebrow">Step 4 · Approval</span>
+              <h2>{job.project_name}</h2>
+              <p className="ap-muted">
+                The coder agent applies your change to this repository, guided by the skill you just
+                reviewed, and produces a diff for you to validate.
+              </p>
+
+              <dl className="ap-meta">
                 <div>
-                  <strong>{files ? files.length : "—"}</strong>
-                  <span>files analysed</span>
+                  <dt>Repository</dt>
+                  <dd className="mono" title={job.repository_url}>{job.repository_url}</dd>
                 </div>
                 <div>
-                  <strong>{skillMd ? skillMd.split("\n").length : "—"}</strong>
-                  <span>lines in skill</span>
+                  <dt>Branch</dt>
+                  <dd className="mono">{job.branch || "main"}</dd>
                 </div>
-              </div>
-            </section>
+                <div>
+                  <dt>Working copy</dt>
+                  <dd className="mono" title={job.local_repo_path ?? ""}>{job.local_repo_path}</dd>
+                </div>
+                <div>
+                  <dt>Skill</dt>
+                  <dd className="ap-ok">✓ Reviewed</dd>
+                </div>
+              </dl>
+            </aside>
 
-            {/* ---------- Tabs ---------- */}
-            <section className="as-card">
-              <div className="as-tabs" role="tablist">
-                <button role="tab" aria-selected={tab === "skill"} className={tab === "skill" ? "is-active" : ""} onClick={() => setTab("skill")}>
-                  Generated skill
-                </button>
-                <button role="tab" aria-selected={tab === "files"} className={tab === "files" ? "is-active" : ""} onClick={() => setTab("files")}>
-                  File analysis
-                </button>
-
-                {tab === "skill" && (
-                  <div className="as-tab-tools">
-                    <button className="as-link" onClick={() => setRaw((r) => !r)}>
-                      {raw ? "Rendered" : "Raw markdown"}
-                    </button>
-                    <button className="as-link" onClick={downloadSkill} disabled={!skillMd}>
-                      Download .md
-                    </button>
-                  </div>
-                )}
-                {tab === "files" && (
-                  <input
-                    className="as-filter"
-                    placeholder="Filter files…"
-                    value={filter}
-                    onChange={(e) => setFilter(e.target.value)}
-                  />
-                )}
-              </div>
-
-              <div className="as-body">
-                {tab === "skill" &&
-                  (skillMd === null ? (
-                    <div className="as-empty">Loading skill…</div>
-                  ) : raw ? (
-                    <pre className="as-raw">{skillMd}</pre>
-                  ) : (
-                    <article className="as-md">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{skillMd}</ReactMarkdown>
-                    </article>
-                  ))}
-
-                {tab === "files" &&
-                  (files === null ? (
-                    <div className="as-empty">Loading file analysis…</div>
-                  ) : visibleFiles.length === 0 ? (
-                    <div className="as-empty">No files match.</div>
-                  ) : (
-                    <ul className="as-files">
-                      {visibleFiles.map((f) => (
-                        <li key={f.path}>
-                          <details>
-                            <summary>
-                              <span className="mono as-path">{f.path}</span>
-                              {f.role_in_repository && <span className="as-role">{f.role_in_repository}</span>}
-                            </summary>
-                            {f.description && <p>{f.description}</p>}
-                            {!!f.key_behavior?.length && (
-                              <ul className="as-bullets">
-                                {f.key_behavior.map((b, i) => <li key={i}>{b}</li>)}
-                              </ul>
-                            )}
-                            {!!f.important_symbols?.length && (
-                              <div className="as-symbols">
-                                {f.important_symbols.map((s, i) => (
-                                  <span key={i} title={s.purpose} className="as-chip">
-                                    <span className="mono">{s.name}</span>
-                                    {s.kind && <em>{s.kind}</em>}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                          </details>
-                        </li>
-                      ))}
-                    </ul>
-                  ))}
-              </div>
-            </section>
-
-            {/* ---------- Proceed ---------- */}
-            <section className="as-footer">
-              <label className="as-check">
-                <input type="checkbox" checked={reviewed} onChange={(e) => setReviewed(e.target.checked)} />
-                I have reviewed the generated skill and it looks correct
+            {/* Right: the change request */}
+            <form className="ap-form" onSubmit={handleSubmit}>
+              <label htmlFor="query" className="ap-label">
+                What should the coder agent change? <span className="ap-req">*</span>
               </label>
-              <button
-                className="as-btn"
-                disabled={!reviewed || !skillMd}
-                onClick={() => navigate(`/migration/${job.id}/approval`)}
-              >
-                Proceed to Approval →
-              </button>
-            </section>
-          </>
+              <textarea
+                id="query"
+                className="ap-textarea"
+                placeholder="e.g. Upgrade the app from React 17 to 18. Replace ReactDOM.render with createRoot and fix any type errors."
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                maxLength={MAX}
+                rows={8}
+                disabled={submitting}
+              />
+              <div className="ap-row">
+                <span className="ap-hint">Be specific: versions, packages, files or patterns to change.</span>
+                <span className="ap-hint">{query.length}/{MAX}</span>
+              </div>
+
+              <div className="ap-examples">
+                <span className="ap-hint">Examples</span>
+                <div>
+                  {EXAMPLES.map((ex) => (
+                    <button key={ex} type="button" className="ap-chip" onClick={() => setQuery(ex)} disabled={submitting}>
+                      {ex}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {submitError && <div className="ap-alert">{submitError}</div>}
+
+              <div className="ap-actions">
+                <button type="button" className="ap-btn is-secondary" onClick={() => navigate(`/migration/${job.id}/assessment`)} disabled={submitting}>
+                  ← Back
+                </button>
+                <button type="submit" className="ap-btn" disabled={!canSubmit}>
+                  {submitting ? "Submitting…" : "Submit code change →"}
+                </button>
+              </div>
+            </form>
+          </section>
         )}
       </div>
     </MainLayout>
   );
 };
 
-export default AssessmentPage;
+export default ApprovalPage;
 
 
-# ---------------------------------------------------------------------------
-# Add to your existing jobs router (app/app/api/.../jobs.py).
-# Serves the files the worker wrote into job.output_path, by a fixed name,
-# so no user input ever becomes part of a filesystem path.
-# ---------------------------------------------------------------------------
-import uuid
-from pathlib import Path
-
-from fastapi import Depends, HTTPException
-from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
-
-# from app.db.session import get_db      # <- use your existing imports
-# from app.models.job import Job
-
-ARTIFACTS: dict[str, tuple[str, str]] = {
-    "skill": ("repository_skill.md", "text/markdown; charset=utf-8"),
-    "file-analysis": ("file_analysis.json", "application/json"),
-    "reading-plan": ("reading_plan.json", "application/json"),
-}
-
-
-@router.get("/{job_id}/artifacts/{name}")
-def get_job_artifact(job_id: uuid.UUID, name: str, db: Session = Depends(get_db)):
-    if name not in ARTIFACTS:
-        raise HTTPException(404, f"Unknown artifact '{name}'. Use one of: {', '.join(ARTIFACTS)}")
-
-    job = db.get(Job, job_id)          # async session: job = await db.get(Job, job_id)
-    if job is None:
-        raise HTTPException(404, "Job not found")
-    if not job.output_path:
-        raise HTTPException(409, "This job has no output yet")
-
-    filename, media_type = ARTIFACTS[name]
-    path = Path(job.output_path) / filename
-    if not path.is_file():
-        raise HTTPException(404, f"{filename} was not generated for this job")
-
-    return FileResponse(path, media_type=media_type)
-
-/* Assessment page — uses the --msf-* variables from SourcePage.css */
-.as-wrap {
+/* Approval page — uses the --msf-* variables from SourcePage.css */
+.ap-wrap {
   width: 100%;
   max-width: 1040px;
   margin: 40px auto;
@@ -302,246 +200,254 @@ def get_job_artifact(job_id: uuid.UUID, name: str, db: Session = Depends(get_db)
 
 .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 
-.as-alert,
-.as-empty {
-  padding: 16px 18px;
+.ap-alert {
+  padding: 12px 16px;
   border-radius: 10px;
+  background: #fdecea;
+  color: #c0362c;
   font-size: 14px;
 }
-.as-alert { background: #fdecea; color: #c0362c; }
-.as-empty {
-  color: var(--msf-muted, #6b6b6b);
+
+.ap-note {
   display: flex;
-  align-items: center;
   justify-content: space-between;
+  align-items: center;
   gap: 12px;
+  padding: 16px 18px;
+  border-radius: 10px;
+  background: #fff;
+  border: 1px solid var(--msf-border, #e6e1da);
+  color: var(--msf-muted, #6b6b6b);
+  font-size: 14px;
 }
 
-/* ---------- Summary ---------- */
-.as-summary {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 24px;
-  padding: 26px 30px;
+.ap-card {
+  display: grid;
+  grid-template-columns: 1fr 1.35fr;
+  background: #fff;
+  border: 1px solid var(--msf-border, #e6e1da);
   border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.04);
+}
+
+/* ---------- Left ---------- */
+.ap-context {
+  position: relative;
+  padding: 36px 34px;
   background: var(--msf-black, #111);
   color: #fff;
-  position: relative;
-  overflow: hidden;
 }
-.as-summary::before {
+.ap-context::before {
   content: "";
   position: absolute;
   inset: 0 auto 0 0;
   width: 6px;
   background: var(--msf-orange, #d9541e);
 }
-.as-eyebrow {
+.ap-eyebrow {
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--msf-orange, #d9541e);
 }
-.as-summary h2 { margin: 6px 0 4px; font-size: 24px; }
-.as-sub { margin: 0; color: #a8a8a8; font-size: 13px; word-break: break-all; }
+.ap-context h2 { margin: 8px 0 10px; font-size: 24px; line-height: 1.25; word-break: break-word; }
+.ap-muted { margin: 0; color: #bdbdbd; font-size: 14px; line-height: 1.6; }
 
-.as-stats { display: flex; gap: 28px; flex: none; }
-.as-stats div { display: grid; text-align: right; }
-.as-stats strong { font-size: 26px; font-variant-numeric: tabular-nums; }
-.as-stats span { font-size: 12px; color: #a8a8a8; }
-
-/* ---------- Card + tabs ---------- */
-.as-card {
-  background: #fff;
-  border: 1px solid var(--msf-border, #e6e1da);
-  border-radius: 14px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.04);
-  overflow: hidden;
-}
-
-.as-tabs {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 0 16px;
-  border-bottom: 1px solid var(--msf-border, #e6e1da);
-  background: var(--msf-cream, #fbf8f4);
-}
-.as-tabs > button[role="tab"] {
-  padding: 14px 14px 12px;
-  border: 0;
-  border-bottom: 3px solid transparent;
-  background: none;
-  font: inherit;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--msf-muted, #6b6b6b);
-  cursor: pointer;
-}
-.as-tabs > button.is-active {
-  color: var(--msf-text, #1f1f1f);
-  border-bottom-color: var(--msf-orange, #d9541e);
-}
-
-.as-tab-tools { margin-left: auto; display: flex; gap: 14px; }
-.as-link {
-  border: 0;
-  background: none;
-  padding: 0;
-  font: inherit;
-  font-size: 13px;
-  color: var(--msf-orange-dark, #b8441a);
-  cursor: pointer;
-}
-.as-link:disabled { color: #bbb; cursor: default; }
-
-.as-filter {
-  margin-left: auto;
-  width: 240px;
-  height: 34px;
-  padding: 0 12px;
-  border: 1.5px solid var(--msf-border, #e6e1da);
-  border-radius: 8px;
-  font: inherit;
-  font-size: 13px;
-  background: #fff;
-  outline: none;
-}
-.as-filter:focus { border-color: var(--msf-orange, #d9541e); }
-
-.as-body {
-  max-height: 60vh;
-  overflow: auto;
-  padding: 24px 30px;
-}
-
-/* ---------- Markdown ---------- */
-.as-md { font-size: 15px; line-height: 1.7; color: var(--msf-text, #1f1f1f); }
-.as-md h1, .as-md h2, .as-md h3 { line-height: 1.3; margin: 1.4em 0 0.5em; }
-.as-md h1 { font-size: 24px; margin-top: 0; }
-.as-md h2 { font-size: 19px; padding-bottom: 6px; border-bottom: 1px solid var(--msf-border, #e6e1da); }
-.as-md h3 { font-size: 16px; }
-.as-md code {
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 0.9em;
-  background: #f4f1ec;
-  padding: 1px 5px;
-  border-radius: 4px;
-}
-.as-md pre {
-  background: var(--msf-black, #111);
-  color: #eee;
-  padding: 14px 16px;
-  border-radius: 10px;
-  overflow-x: auto;
-}
-.as-md pre code { background: none; padding: 0; color: inherit; }
-.as-md table { border-collapse: collapse; width: 100%; font-size: 14px; }
-.as-md th, .as-md td { border: 1px solid var(--msf-border, #e6e1da); padding: 6px 10px; text-align: left; }
-.as-md th { background: var(--msf-cream, #fbf8f4); }
-.as-md blockquote {
+.ap-meta { margin: 26px 0 0; display: grid; gap: 14px; }
+.ap-meta div { display: grid; gap: 3px; min-width: 0; }
+.ap-meta dt { font-size: 12px; color: #9a9a9a; }
+.ap-meta dd {
   margin: 0;
-  padding: 4px 16px;
-  border-left: 3px solid var(--msf-orange, #d9541e);
-  color: var(--msf-muted, #6b6b6b);
-}
-
-.as-raw {
-  margin: 0;
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 13px;
-  line-height: 1.6;
-  white-space: pre-wrap;
-}
-
-/* ---------- File analysis ---------- */
-.as-files { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
-.as-files > li details {
-  border: 1px solid var(--msf-border, #e6e1da);
-  border-radius: 10px;
-  padding: 10px 14px;
-}
-.as-files > li details[open] { background: var(--msf-cream, #fbf8f4); }
-.as-files summary {
-  display: flex;
-  gap: 12px;
-  align-items: baseline;
-  cursor: pointer;
-  list-style: none;
-}
-.as-files summary::-webkit-details-marker { display: none; }
-.as-path { font-size: 13.5px; font-weight: 600; flex: none; }
-.as-role {
-  font-size: 13px;
-  color: var(--msf-muted, #6b6b6b);
+  font-size: 13.5px;
+  color: #fff;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.as-files p { margin: 10px 0 0; font-size: 14px; line-height: 1.6; }
-.as-bullets { margin: 8px 0 0; padding-left: 18px; font-size: 13.5px; }
-.as-symbols { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
-.as-chip {
-  display: inline-flex;
-  gap: 6px;
-  align-items: baseline;
-  padding: 3px 9px;
-  border-radius: 999px;
-  background: #fff;
-  border: 1px solid var(--msf-border, #e6e1da);
-  font-size: 12.5px;
-}
-.as-chip em { font-style: normal; color: var(--msf-orange-dark, #b8441a); font-size: 11.5px; }
+.ap-ok { color: #7fd69a !important; font-weight: 600; }
 
-/* ---------- Footer ---------- */
-.as-footer {
-  position: sticky;
-  bottom: 16px;
+/* ---------- Right ---------- */
+.ap-form { padding: 36px 38px; display: flex; flex-direction: column; }
+
+.ap-label { font-size: 15px; font-weight: 600; margin-bottom: 10px; }
+.ap-req { color: var(--msf-orange, #d9541e); }
+
+.ap-textarea {
+  width: 100%;
+  min-height: 180px;
+  resize: vertical;
+  padding: 14px 16px;
+  border: 1.5px solid var(--msf-border, #e6e1da);
+  border-radius: 10px;
+  background: var(--msf-cream, #fbf8f4);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--msf-text, #1f1f1f);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+  box-sizing: border-box;
+}
+.ap-textarea:focus {
+  background: #fff;
+  border-color: var(--msf-orange, #d9541e);
+  box-shadow: 0 0 0 3px rgba(217, 84, 30, 0.15);
+}
+
+.ap-row { display: flex; justify-content: space-between; gap: 12px; margin-top: 6px; }
+.ap-hint { font-size: 12.5px; color: var(--msf-muted, #6b6b6b); }
+
+.ap-examples { margin-top: 20px; display: grid; gap: 8px; }
+.ap-examples > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.ap-chip {
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--msf-border, #e6e1da);
+  background: #fff;
+  font: inherit;
+  font-size: 13px;
+  color: var(--msf-text, #1f1f1f);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.ap-chip:hover:not(:disabled) {
+  border-color: var(--msf-orange, #d9541e);
+  background: var(--msf-orange-soft, #fdf0e9);
+}
+
+.ap-form .ap-alert { margin-top: 16px; }
+
+.ap-actions {
+  margin-top: 28px;
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
-  padding: 16px 22px;
-  background: #fff;
-  border: 1px solid var(--msf-border, #e6e1da);
-  border-radius: 14px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+  gap: 12px;
 }
-.as-check {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 14px;
-  cursor: pointer;
-}
-.as-check input { width: 18px; height: 18px; accent-color: var(--msf-orange, #d9541e); }
 
-.as-btn {
-  height: 44px;
+.ap-btn {
+  height: 46px;
   padding: 0 24px;
   border: 0;
   border-radius: 10px;
   background: var(--msf-orange, #d9541e);
   color: #fff;
-  font-size: 14.5px;
+  font-size: 15px;
   font-weight: 600;
   cursor: pointer;
 }
-.as-btn:hover:not(:disabled) { background: var(--msf-orange-dark, #b8441a); }
-.as-btn:disabled { background: #e4b8a5; cursor: not-allowed; }
-.as-btn.is-secondary {
-  height: 38px;
+.ap-btn:hover:not(:disabled) { background: var(--msf-orange-dark, #b8441a); }
+.ap-btn:disabled { background: #e4b8a5; cursor: not-allowed; }
+.ap-btn.is-secondary {
   background: #fff;
   color: var(--msf-text, #1f1f1f);
   border: 1.5px solid var(--msf-border, #e6e1da);
 }
+.ap-btn.is-secondary:hover:not(:disabled) { border-color: var(--msf-orange, #d9541e); background: #fff; }
+.ap-btn.is-secondary:disabled { background: #fff; color: #aaa; }
 
-@media (max-width: 760px) {
-  .as-summary { flex-direction: column; align-items: flex-start; }
-  .as-stats div { text-align: left; }
-  .as-filter { width: 100%; margin: 8px 0; }
-  .as-tabs { flex-wrap: wrap; }
+@media (max-width: 900px) {
+  .ap-card { grid-template-columns: 1fr; }
+  .ap-context, .ap-form { padding: 26px 22px; }
 }
+
+
+# ===========================================================================
+# 1) API  —  app/app/schemas/job.py
+#    New optional fields on create; return them on read so the UI can copy them.
+# ===========================================================================
+from pydantic import BaseModel, Field
+
+
+class JobCreate(BaseModel):
+    project_name: str = Field(min_length=1, max_length=255)
+    repository_url: str = Field(min_length=1, max_length=500)
+    branch: str = "main"
+    description: str | None = None
+    # new / now optional on create
+    job_type: str = "skill"                 # "skill" | "code"
+    user_query: str | None = None
+    local_repo_path: str | None = None
+    output_path: str | None = None
+
+
+class JobRead(BaseModel):                   # add the two new fields to your existing read schema
+    # ...existing fields...
+    local_repo_path: str | None = None
+    output_path: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
+# In your create service / repository: never trust status from the client.
+#     job = Job(**payload.model_dump(), status="queued", progress_percentage=0)
+#
+# Optional validation in the create endpoint:
+#     if payload.job_type == "code" and not (payload.user_query and payload.local_repo_path):
+#         raise HTTPException(422, "Code jobs need user_query and local_repo_path")
+
+
+# ===========================================================================
+# 2) WORKER  —  backend/job_worker/mainworker.py
+#    Replace build_query() and the "# 3. result" block.
+# ===========================================================================
+from pathlib import Path
+
+CODE_JOB_TYPES = {"code"}
+
+# Static instruction that makes the planner pick the coder agent only
+CODER_INSTRUCTION = (
+    "Run only the coder_agent. Do not generate or update skills. "
+    "Apply the change request below to the repository and produce a diff."
+)
+
+
+def is_code_job(job) -> bool:
+    return (job.job_type or "").lower() in CODE_JOB_TYPES
+
+
+def build_query(job, repo_path: Path) -> str:
+    if is_code_job(job):
+        lines = [CODER_INSTRUCTION, f"Repository path: {repo_path}"]
+        if job.output_path:
+            lines.append(f"Use the repository skill at: {Path(job.output_path) / 'repository_skill.md'}")
+        lines.append(f"Change request: {job.user_query}")
+        return "\n".join(lines)
+
+    # skill job (unchanged)
+    query = f"create skills using this path {repo_path}"
+    if job.user_query:
+        query += f". {job.user_query}"
+    return query
+
+
+# --- inside process_job(), at the very top of the try: block ----------------
+#     if is_code_job(job) and not job.user_query:
+#         raise ValueError("Code job has no change request (user_query is empty)")
+#
+# (local_repo_path is already set on code jobs, so the git fetch step is skipped)
+
+
+# --- replace the "# 3. result" block ----------------------------------------
+#     agent_status = str(response.status).lower()
+#     result = response.result
+#
+#     if is_code_job(job):
+#         coder = getattr(result, "coder", None) if result else None
+#         output_path = getattr(coder, "output_dir", None) or getattr(coder, "diff_path", None)
+#     else:
+#         skill = getattr(result, "skill", None) if result else None
+#         output_path = skill.output_dir if skill else None
+#
+#     if agent_status in SUCCESS_AGENT_STATUSES:
+#         update_job(
+#             job_id,
+#             status=COMPLETED,
+#             progress_percentage=100,
+#             progress_message="Completed",
+#             output_path=str(output_path) if output_path else job.output_path,
+#         )
+#     else:
+#         update_job(job_id, status=FAILED, progress_message=f"Agent stopped: {agent_status}")
+
