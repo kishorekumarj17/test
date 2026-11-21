@@ -1,231 +1,547 @@
-"""
-Background job worker for Migration Skill Factory.
+import React, { useEffect, useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+// Keep your existing import paths for these two:
+import MainLayout from "../layouts/MainLayout";
+import WorkflowNav from "../components/WorkflowNav";
+import { Job, jobState } from "../hooks/useJobPolling";
+import "./AssessmentPage.css";
 
-Every POLL_SECONDS:
-  1. claims the oldest queued job (status -> running)
-  2. pulls the repo if the job has no local_repo_path yet
-  3. runs the main orchestration agent with the job details
-  4. agents report progress through report(pct, [stage,] message) -> job row
-  5. marks the job completed / failed
+const API = import.meta.env.VITE_API_BASE_URL;
 
-Run from the backend/ folder:
-    python -m job_worker.worker
-"""
-from __future__ import annotations
+type FileEntry = {
+  path: string;
+  description?: string;
+  role_in_repository?: string;
+  key_behavior?: string[];
+  dependency_usage?: unknown[];
+  important_symbols?: { name: string; kind?: string; purpose?: string }[];
+  uncertainties?: unknown[];
+};
 
-import logging
-import os
-import signal
-import time
-import traceback
+type Tab = "skill" | "files";
+
+async function getJson<T>(url: string): Promise<T> {
+  const res = await fetch(url);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body?.detail ?? `Request failed (${res.status})`);
+  }
+  return res.json();
+}
+
+export const AssessmentPage: React.FC = () => {
+  const navigate = useNavigate();
+  const { migrationId } = useParams();
+
+  const [job, setJob] = useState<Job | null>(null);
+  const [skillMd, setSkillMd] = useState<string | null>(null);
+  const [files, setFiles] = useState<FileEntry[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const [tab, setTab] = useState<Tab>("skill");
+  const [raw, setRaw] = useState(false);
+  const [filter, setFilter] = useState("");
+  const [reviewed, setReviewed] = useState(false);
+
+  // Job + skill on page load
+  useEffect(() => {
+    if (!migrationId) return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const j = await getJson<Job>(`${API}/jobs/${migrationId}`);
+        if (cancelled) return;
+        setJob(j);
+        if (jobState(j.status) !== "done") return;
+
+        const res = await fetch(`${API}/jobs/${migrationId}/artifacts/skill`);
+        if (!res.ok) throw new Error("Could not load the generated skill");
+        const text = await res.text();
+        if (!cancelled) setSkillMd(text);
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : "Something went wrong");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [migrationId]);
+
+  // File analysis only when its tab is opened
+  useEffect(() => {
+    if (tab !== "files" || files || !migrationId) return;
+    getJson<Record<string, FileEntry>>(`${API}/jobs/${migrationId}/artifacts/file-analysis`)
+      .then((data) => setFiles(Object.values(data)))
+      .catch(() => setFiles([]));
+  }, [tab, files, migrationId]);
+
+  const visibleFiles = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!files) return [];
+    return q
+      ? files.filter(
+          (f) =>
+            f.path.toLowerCase().includes(q) ||
+            f.description?.toLowerCase().includes(q)
+        )
+      : files;
+  }, [files, filter]);
+
+  const downloadSkill = () => {
+    if (!skillMd) return;
+    const url = URL.createObjectURL(new Blob([skillMd], { type: "text/markdown" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${job?.project_name ?? "repository"}_skill.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const state = jobState(job?.status);
+
+  return (
+    <MainLayout
+      title="Migration Skill Factory"
+      subtitle="Review the generated skill"
+      stepNumber={3}
+      totalSteps={5}
+      workflow={<WorkflowNav currentStep="assessment" migrationId={migrationId} />}
+    >
+      <div className="as-wrap">
+        {error && <div className="as-alert">{error}</div>}
+        {!job && !error && <div className="as-empty">Loading…</div>}
+
+        {job && state !== "done" && (
+          <div className="as-empty">
+            This job is still <strong>{job.status}</strong>. Come back when the scan has finished.
+            <button className="as-btn is-secondary" onClick={() => navigate(`/migration/${job.id}/scan`)}>
+              Back to scan
+            </button>
+          </div>
+        )}
+
+        {job && state === "done" && (
+          <>
+            {/* ---------- Summary ---------- */}
+            <section className="as-summary">
+              <div>
+                <span className="as-eyebrow">Assessment</span>
+                <h2>{job.project_name}</h2>
+                <p className="as-sub mono">
+                  {job.repository_url} @ {job.branch || "main"}
+                </p>
+              </div>
+              <div className="as-stats">
+                <div>
+                  <strong>{files ? files.length : "—"}</strong>
+                  <span>files analysed</span>
+                </div>
+                <div>
+                  <strong>{skillMd ? skillMd.split("\n").length : "—"}</strong>
+                  <span>lines in skill</span>
+                </div>
+              </div>
+            </section>
+
+            {/* ---------- Tabs ---------- */}
+            <section className="as-card">
+              <div className="as-tabs" role="tablist">
+                <button role="tab" aria-selected={tab === "skill"} className={tab === "skill" ? "is-active" : ""} onClick={() => setTab("skill")}>
+                  Generated skill
+                </button>
+                <button role="tab" aria-selected={tab === "files"} className={tab === "files" ? "is-active" : ""} onClick={() => setTab("files")}>
+                  File analysis
+                </button>
+
+                {tab === "skill" && (
+                  <div className="as-tab-tools">
+                    <button className="as-link" onClick={() => setRaw((r) => !r)}>
+                      {raw ? "Rendered" : "Raw markdown"}
+                    </button>
+                    <button className="as-link" onClick={downloadSkill} disabled={!skillMd}>
+                      Download .md
+                    </button>
+                  </div>
+                )}
+                {tab === "files" && (
+                  <input
+                    className="as-filter"
+                    placeholder="Filter files…"
+                    value={filter}
+                    onChange={(e) => setFilter(e.target.value)}
+                  />
+                )}
+              </div>
+
+              <div className="as-body">
+                {tab === "skill" &&
+                  (skillMd === null ? (
+                    <div className="as-empty">Loading skill…</div>
+                  ) : raw ? (
+                    <pre className="as-raw">{skillMd}</pre>
+                  ) : (
+                    <article className="as-md">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{skillMd}</ReactMarkdown>
+                    </article>
+                  ))}
+
+                {tab === "files" &&
+                  (files === null ? (
+                    <div className="as-empty">Loading file analysis…</div>
+                  ) : visibleFiles.length === 0 ? (
+                    <div className="as-empty">No files match.</div>
+                  ) : (
+                    <ul className="as-files">
+                      {visibleFiles.map((f) => (
+                        <li key={f.path}>
+                          <details>
+                            <summary>
+                              <span className="mono as-path">{f.path}</span>
+                              {f.role_in_repository && <span className="as-role">{f.role_in_repository}</span>}
+                            </summary>
+                            {f.description && <p>{f.description}</p>}
+                            {!!f.key_behavior?.length && (
+                              <ul className="as-bullets">
+                                {f.key_behavior.map((b, i) => <li key={i}>{b}</li>)}
+                              </ul>
+                            )}
+                            {!!f.important_symbols?.length && (
+                              <div className="as-symbols">
+                                {f.important_symbols.map((s, i) => (
+                                  <span key={i} title={s.purpose} className="as-chip">
+                                    <span className="mono">{s.name}</span>
+                                    {s.kind && <em>{s.kind}</em>}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </details>
+                        </li>
+                      ))}
+                    </ul>
+                  ))}
+              </div>
+            </section>
+
+            {/* ---------- Proceed ---------- */}
+            <section className="as-footer">
+              <label className="as-check">
+                <input type="checkbox" checked={reviewed} onChange={(e) => setReviewed(e.target.checked)} />
+                I have reviewed the generated skill and it looks correct
+              </label>
+              <button
+                className="as-btn"
+                disabled={!reviewed || !skillMd}
+                onClick={() => navigate(`/migration/${job.id}/approval`)}
+              >
+                Proceed to Approval →
+              </button>
+            </section>
+          </>
+        )}
+      </div>
+    </MainLayout>
+  );
+};
+
+export default AssessmentPage;
+
+
+# ---------------------------------------------------------------------------
+# Add to your existing jobs router (app/app/api/.../jobs.py).
+# Serves the files the worker wrote into job.output_path, by a fixed name,
+# so no user input ever becomes part of a filesystem path.
+# ---------------------------------------------------------------------------
 import uuid
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Optional
 
-from dotenv import load_dotenv
-from sqlalchemy import DateTime, Integer, String, Text, create_engine, func, select, update
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from fastapi import Depends, HTTPException
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
 
-from job_worker.git_fetch import fetch_repo
-from orchestrator.run import RunRequest, run_main_agent
+# from app.db.session import get_db      # <- use your existing imports
+# from app.models.job import Job
 
-load_dotenv()
-
-# ---------------------------------------------------------------- config
-# Must point at the SAME database the FastAPI app writes jobs to
-# (migration_skill_db). Use a sync driver URL, e.g. postgresql+psycopg2://...
-DB_URL = os.getenv("JOBS_DATABASE_URL") or os.environ["DATABASE_URL"]
-POLL_SECONDS = int(os.getenv("WORKER_POLL_SECONDS", "5"))
-
-QUEUED_STATUSES = ("queued", "pending")
-RUNNING, COMPLETED, FAILED = "running", "completed", "failed"
-SUCCESS_AGENT_STATUSES = {"completed", "success", "succeeded", "ok", "done"}
-
-log = logging.getLogger("job_worker")
-_stop = False
-
-ReportFn = Callable[..., None]
+ARTIFACTS: dict[str, tuple[str, str]] = {
+    "skill": ("repository_skill.md", "text/markdown; charset=utf-8"),
+    "file-analysis": ("file_analysis.json", "application/json"),
+    "reading-plan": ("reading_plan.json", "application/json"),
+}
 
 
-# ---------------------------------------------------------------- model
-# Mirror of app/app/models/job.py (the API owns the table and its Alembic
-# migrations). Only map what the worker reads or writes. Never call
-# Base.metadata.create_all() here.
-class Base(DeclarativeBase):
-    pass
+@router.get("/{job_id}/artifacts/{name}")
+def get_job_artifact(job_id: uuid.UUID, name: str, db: Session = Depends(get_db)):
+    if name not in ARTIFACTS:
+        raise HTTPException(404, f"Unknown artifact '{name}'. Use one of: {', '.join(ARTIFACTS)}")
 
+    job = db.get(Job, job_id)          # async session: job = await db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if not job.output_path:
+        raise HTTPException(409, "This job has no output yet")
 
-class Job(Base):
-    __tablename__ = "jobs"
+    filename, media_type = ARTIFACTS[name]
+    path = Path(job.output_path) / filename
+    if not path.is_file():
+        raise HTTPException(404, f"{filename} was not generated for this job")
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    project_name: Mapped[str] = mapped_column(String(255))
-    repository_url: Mapped[str] = mapped_column(String(500))
-    branch: Mapped[str | None] = mapped_column(String(500))
-    local_repo_path: Mapped[str | None] = mapped_column(String(500))
-    output_path: Mapped[str | None] = mapped_column(String(500))
-    description: Mapped[str | None] = mapped_column(Text)
-    progress_percentage: Mapped[int] = mapped_column(Integer, default=0)
-    status: Mapped[str] = mapped_column(String(50))
-    job_type: Mapped[str | None] = mapped_column(String(50))
-    user_query: Mapped[str | None] = mapped_column(Text)
-    progress_message: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
-    )
+    return FileResponse(path, media_type=media_type)
 
+/* Assessment page — uses the --msf-* variables from SourcePage.css */
+.as-wrap {
+  width: 100%;
+  max-width: 1040px;
+  margin: 40px auto;
+  display: grid;
+  gap: 20px;
+}
 
-# ---------------------------------------------------------------- db helpers
-engine = create_engine(
-    DB_URL.replace("+asyncpg", "+psycopg2"),  # worker is sync
-    pool_pre_ping=True,
-    pool_size=2,
-    max_overflow=2,
-)
-# expire_on_commit=False: the claimed Job stays readable after the session closes
-SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 
+.as-alert,
+.as-empty {
+  padding: 16px 18px;
+  border-radius: 10px;
+  font-size: 14px;
+}
+.as-alert { background: #fdecea; color: #c0362c; }
+.as-empty {
+  color: var(--msf-muted, #6b6b6b);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
 
-def claim_next_job() -> Optional[Job]:
-    """Atomically take the oldest queued job and mark it running.
-    SKIP LOCKED makes it safe to run more than one worker."""
-    with SessionLocal.begin() as session:
-        job = session.scalars(
-            select(Job)
-            .where(Job.status.in_(QUEUED_STATUSES))
-            .order_by(Job.created_at.asc())
-            .limit(1)
-            .with_for_update(skip_locked=True)
-        ).first()
-        if job is None:
-            return None
-        job.status = RUNNING
-        job.progress_percentage = 0
-        job.progress_message = "Picked up by worker"
-        return job  # committed when the block exits
+/* ---------- Summary ---------- */
+.as-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+  padding: 26px 30px;
+  border-radius: 14px;
+  background: var(--msf-black, #111);
+  color: #fff;
+  position: relative;
+  overflow: hidden;
+}
+.as-summary::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 6px;
+  background: var(--msf-orange, #d9541e);
+}
+.as-eyebrow {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--msf-orange, #d9541e);
+}
+.as-summary h2 { margin: 6px 0 4px; font-size: 24px; }
+.as-sub { margin: 0; color: #a8a8a8; font-size: 13px; word-break: break-all; }
 
+.as-stats { display: flex; gap: 28px; flex: none; }
+.as-stats div { display: grid; text-align: right; }
+.as-stats strong { font-size: 26px; font-variant-numeric: tabular-nums; }
+.as-stats span { font-size: 12px; color: #a8a8a8; }
 
-def update_job(job_id: uuid.UUID, **fields: Any) -> None:
-    """Short transaction per update so the UI sees progress immediately."""
-    with SessionLocal.begin() as session:
-        session.execute(update(Job).where(Job.id == job_id).values(**fields))
+/* ---------- Card + tabs ---------- */
+.as-card {
+  background: #fff;
+  border: 1px solid var(--msf-border, #e6e1da);
+  border-radius: 14px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.04);
+  overflow: hidden;
+}
 
+.as-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--msf-border, #e6e1da);
+  background: var(--msf-cream, #fbf8f4);
+}
+.as-tabs > button[role="tab"] {
+  padding: 14px 14px 12px;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  background: none;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--msf-muted, #6b6b6b);
+  cursor: pointer;
+}
+.as-tabs > button.is-active {
+  color: var(--msf-text, #1f1f1f);
+  border-bottom-color: var(--msf-orange, #d9541e);
+}
 
-# ---------------------------------------------------------------- progress
-def make_reporter(job_id: uuid.UUID) -> ReportFn:
-    """Returns report(percent, message) or report(percent, stage, message).
+.as-tab-tools { margin-left: auto; display: flex; gap: 14px; }
+.as-link {
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 13px;
+  color: var(--msf-orange-dark, #b8441a);
+  cursor: pointer;
+}
+.as-link:disabled { color: #bbb; cursor: default; }
 
-    - percent is clamped to 0..100 and never goes backwards
-    - failures to write progress are logged, never raised into the agent
-    """
-    last = {"pct": 0}
+.as-filter {
+  margin-left: auto;
+  width: 240px;
+  height: 34px;
+  padding: 0 12px;
+  border: 1.5px solid var(--msf-border, #e6e1da);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  background: #fff;
+  outline: none;
+}
+.as-filter:focus { border-color: var(--msf-orange, #d9541e); }
 
-    def report(percent: int, stage_or_message: str, message: Optional[str] = None) -> None:
-        stage, msg = (stage_or_message, message) if message is not None else (None, stage_or_message)
-        pct = max(last["pct"], min(100, max(0, int(percent))))
-        last["pct"] = pct
-        log.info("job %s | %3d%% | %s%s", job_id, pct, f"[{stage}] " if stage else "", msg)
-        try:
-            update_job(job_id, progress_percentage=pct, progress_message=str(msg)[:2000])
-        except Exception:  # never break the agent because of a progress write
-            log.exception("could not write progress for job %s", job_id)
+.as-body {
+  max-height: 60vh;
+  overflow: auto;
+  padding: 24px 30px;
+}
 
-    return report
+/* ---------- Markdown ---------- */
+.as-md { font-size: 15px; line-height: 1.7; color: var(--msf-text, #1f1f1f); }
+.as-md h1, .as-md h2, .as-md h3 { line-height: 1.3; margin: 1.4em 0 0.5em; }
+.as-md h1 { font-size: 24px; margin-top: 0; }
+.as-md h2 { font-size: 19px; padding-bottom: 6px; border-bottom: 1px solid var(--msf-border, #e6e1da); }
+.as-md h3 { font-size: 16px; }
+.as-md code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.9em;
+  background: #f4f1ec;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.as-md pre {
+  background: var(--msf-black, #111);
+  color: #eee;
+  padding: 14px 16px;
+  border-radius: 10px;
+  overflow-x: auto;
+}
+.as-md pre code { background: none; padding: 0; color: inherit; }
+.as-md table { border-collapse: collapse; width: 100%; font-size: 14px; }
+.as-md th, .as-md td { border: 1px solid var(--msf-border, #e6e1da); padding: 6px 10px; text-align: left; }
+.as-md th { background: var(--msf-cream, #fbf8f4); }
+.as-md blockquote {
+  margin: 0;
+  padding: 4px 16px;
+  border-left: 3px solid var(--msf-orange, #d9541e);
+  color: var(--msf-muted, #6b6b6b);
+}
 
+.as-raw {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
 
-# ---------------------------------------------------------------- job processing
-def build_query(job: Job, repo_path: Path) -> str:
-    query = f"create skills using this path {repo_path}"
-    if job.user_query:
-        query += f". {job.user_query}"
-    return query
+/* ---------- File analysis ---------- */
+.as-files { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.as-files > li details {
+  border: 1px solid var(--msf-border, #e6e1da);
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+.as-files > li details[open] { background: var(--msf-cream, #fbf8f4); }
+.as-files summary {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  cursor: pointer;
+  list-style: none;
+}
+.as-files summary::-webkit-details-marker { display: none; }
+.as-path { font-size: 13.5px; font-weight: 600; flex: none; }
+.as-role {
+  font-size: 13px;
+  color: var(--msf-muted, #6b6b6b);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.as-files p { margin: 10px 0 0; font-size: 14px; line-height: 1.6; }
+.as-bullets { margin: 8px 0 0; padding-left: 18px; font-size: 13.5px; }
+.as-symbols { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+.as-chip {
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: #fff;
+  border: 1px solid var(--msf-border, #e6e1da);
+  font-size: 12.5px;
+}
+.as-chip em { font-style: normal; color: var(--msf-orange-dark, #b8441a); font-size: 11.5px; }
 
+/* ---------- Footer ---------- */
+.as-footer {
+  position: sticky;
+  bottom: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 16px 22px;
+  background: #fff;
+  border: 1px solid var(--msf-border, #e6e1da);
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+}
+.as-check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.as-check input { width: 18px; height: 18px; accent-color: var(--msf-orange, #d9541e); }
 
-def process_job(job: Job) -> None:
-    job_id = job.id
-    report = make_reporter(job_id)
-    log.info("job %s claimed: %s", job_id, job.project_name)
+.as-btn {
+  height: 44px;
+  padding: 0 24px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--msf-orange, #d9541e);
+  color: #fff;
+  font-size: 14.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.as-btn:hover:not(:disabled) { background: var(--msf-orange-dark, #b8441a); }
+.as-btn:disabled { background: #e4b8a5; cursor: not-allowed; }
+.as-btn.is-secondary {
+  height: 38px;
+  background: #fff;
+  color: var(--msf-text, #1f1f1f);
+  border: 1.5px solid var(--msf-border, #e6e1da);
+}
 
-    try:
-        # 1. source code
-        local = job.local_repo_path
-        if local and Path(local).exists():
-            repo_path = Path(local)
-            report(10, "git", f"Using existing local repository {repo_path}")
-        else:
-            repo_url = job.repository_url
-            branch = job.branch
-            if branch:
-                repo_url = f"{repo_url}#{branch}"  # git_fetch understands repo#branch
-            repo_path = fetch_repo(job.project_name, repo_url, report)
-            update_job(job_id, local_repo_path=str(repo_path))
-
-        # 2. main agent
-        report(25, "agent", "Starting main agent")
-        request = RunRequest(query=build_query(job, repo_path), selected_skill_ids=[])
-        response = run_main_agent(request, report=report)
-
-        # 3. result
-        agent_status = str(getattr(response, "status", "")).lower()
-        output_path = getattr(response, "output_path", None) or getattr(response, "output_dir", None)
-
-        if agent_status in SUCCESS_AGENT_STATUSES:
-            update_job(
-                job_id,
-                status=COMPLETED,
-                progress_percentage=100,
-                progress_message="Completed",
-                output_path=str(output_path) if output_path else None,
-            )
-            log.info("job %s completed", job_id)
-        else:
-            reason = getattr(response, "message", None) or getattr(response, "error", None) or agent_status
-            update_job(job_id, status=FAILED, progress_message=f"Agent stopped: {reason}"[:2000])
-            log.warning("job %s failed: %s", job_id, reason)
-
-    except Exception as exc:
-        log.error("job %s crashed:\n%s", job_id, traceback.format_exc())
-        update_job(job_id, status=FAILED, progress_message=f"Error: {exc}"[:2000])
-
-
-# ---------------------------------------------------------------- main loop
-def _handle_stop(*_: Any) -> None:
-    global _stop
-    _stop = True
-    log.info("stop requested, finishing current job…")
-
-
-def main() -> None:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    )
-    signal.signal(signal.SIGINT, _handle_stop)
-    signal.signal(signal.SIGTERM, _handle_stop)
-
-    log.info("worker started, polling jobs every %ss", POLL_SECONDS)
-
-    while not _stop:
-        try:
-            job = claim_next_job()
-        except Exception:
-            log.exception("could not poll for jobs")
-            job = None
-
-        if job:
-            process_job(job)  # check again immediately after a job
-            continue
-
-        for _ in range(POLL_SECONDS * 10):  # sleep, but react quickly to Ctrl+C
-            if _stop:
-                break
-            time.sleep(0.1)
-
-    log.info("worker stopped")
-
-
-if __name__ == "__main__":
-    main()
+@media (max-width: 760px) {
+  .as-summary { flex-direction: column; align-items: flex-start; }
+  .as-stats div { text-align: left; }
+  .as-filter { width: 100%; margin: 8px 0; }
+  .as-tabs { flex-wrap: wrap; }
+}
