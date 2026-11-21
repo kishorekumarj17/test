@@ -9,14 +9,25 @@ import "./SourcePage.css";
 /*  API call — replace the body with the call your old handleSubmit   */
 /*  used (from src/api or src/services). It must return the new id.   */
 /* ------------------------------------------------------------------ */
+type SourcePayload = {
+  appName: string;
+  description: string;
+  repoUrl: string;
+  branch: string;
+};
+
 async function submitSource(
-  repoUrl: string,
-  branch: string
+  p: SourcePayload
 ): Promise<{ id: string | number }> {
   const res = await fetch(`${import.meta.env.VITE_API_BASE_URL}/jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ repo_url: repoUrl, branch }),
+    body: JSON.stringify({
+      name: p.appName,
+      description: p.description || null,
+      repo_url: p.repoUrl,
+      branch: p.branch,
+    }),
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -41,6 +52,13 @@ const GitIcon = () => (
   </svg>
 );
 
+const AppIcon = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M3 9h18M7 6.5h.01M10 6.5h.01" />
+  </svg>
+);
+
 const BranchIcon = () => (
   <svg viewBox="0 0 24 24" aria-hidden="true">
     <circle cx="6" cy="5" r="2" />
@@ -54,6 +72,8 @@ export const SourcePage: React.FC = () => {
   const navigate = useNavigate();
   const { migrationId } = useParams();
 
+  const [appName, setAppName] = useState("");
+  const [description, setDescription] = useState("");
   const [repoUrl, setRepoUrl] = useState("");
   const [branch, setBranch] = useState("main");
   const [touched, setTouched] = useState(false);
@@ -62,7 +82,15 @@ export const SourcePage: React.FC = () => {
 
   const repo = useMemo(() => parseRepo(repoUrl), [repoUrl]);
   const urlInvalid = touched && repoUrl.trim() !== "" && !repo;
-  const canSubmit = !!repo && branch.trim() !== "" && !isLoading;
+  const nameInvalid = touched && appName.trim() === "";
+  const canSubmit =
+    appName.trim() !== "" && !!repo && branch.trim() !== "" && !isLoading;
+
+  // Fill the app name from the repo name if the user hasn't typed one
+  const handleRepoBlur = () => {
+    setTouched(true);
+    if (!appName.trim() && repo) setAppName(repo.name);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -71,7 +99,12 @@ export const SourcePage: React.FC = () => {
     setIsLoading(true);
     setError(null);
     try {
-      const created = await submitSource(repoUrl.trim(), branch.trim());
+      const created = await submitSource({
+        appName: appName.trim(),
+        description: description.trim(),
+        repoUrl: repoUrl.trim(),
+        branch: branch.trim(),
+      });
       navigate(`/migration/${created.id}/scan`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong.");
@@ -132,6 +165,48 @@ export const SourcePage: React.FC = () => {
 
         {/* Right: the form */}
         <form className="src-form" onSubmit={handleSubmit} noValidate>
+          <label htmlFor="appName" className="src-label">
+            Application name <span className="src-req">*</span>
+          </label>
+          <div className={`src-input ${nameInvalid ? "is-invalid" : ""}`}>
+            <AppIcon />
+            <input
+              id="appName"
+              type="text"
+              placeholder="e.g. Customer Portal"
+              value={appName}
+              onChange={(e) => setAppName(e.target.value)}
+              maxLength={100}
+              autoComplete="off"
+              disabled={isLoading}
+              aria-invalid={nameInvalid}
+              className="src-input-plain"
+            />
+          </div>
+          <p className={`src-hint ${nameInvalid ? "is-error" : ""}`}>
+            {nameInvalid
+              ? "Application name is required."
+              : "Filled from the repo name if you leave it blank."}
+          </p>
+
+          <label htmlFor="description" className="src-label">
+            Description <span className="src-optional">optional</span>
+          </label>
+          <div className="src-input src-textarea">
+            <textarea
+              id="description"
+              placeholder="What does this application do? Any migration notes?"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              maxLength={500}
+              rows={3}
+              disabled={isLoading}
+            />
+          </div>
+          <p className="src-hint src-counter">{description.length}/500</p>
+
+          <div className="src-divider" />
+
           <label htmlFor="repoUrl" className="src-label">
             Repository URL <span className="src-req">*</span>
           </label>
@@ -143,7 +218,7 @@ export const SourcePage: React.FC = () => {
               placeholder="https://github.com/org/repo.git"
               value={repoUrl}
               onChange={(e) => setRepoUrl(e.target.value)}
-              onBlur={() => setTouched(true)}
+              onBlur={handleRepoBlur}
               autoComplete="off"
               spellCheck={false}
               disabled={isLoading}
@@ -205,7 +280,6 @@ export const SourcePage: React.FC = () => {
 };
 
 export default SourcePage;
-
 
 
 /* Source / onboarding page — matches the MSF black + orange theme */
@@ -393,6 +467,52 @@ export default SourcePage;
 
 .src-hint.is-error {
   color: var(--msf-error);
+}
+
+.src-input input.src-input-plain {
+  font-family: inherit;
+  font-size: 15px;
+}
+
+.src-optional {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--msf-muted);
+}
+
+.src-textarea {
+  height: auto;
+  padding: 12px 14px;
+  align-items: stretch;
+}
+
+.src-textarea textarea {
+  flex: 1;
+  border: 0;
+  outline: 0;
+  resize: vertical;
+  min-height: 72px;
+  background: transparent;
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--msf-text);
+}
+
+.src-textarea textarea::placeholder {
+  color: #a3a3a3;
+}
+
+.src-counter {
+  text-align: right;
+  margin-top: 6px;
+}
+
+.src-divider {
+  height: 1px;
+  background: var(--msf-border);
+  margin: 4px 0 24px;
 }
 
 /* Parsed repo preview */
