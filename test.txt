@@ -1,0 +1,488 @@
+import React, { useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+// Keep your existing import paths for these two — adjust if they differ:
+import MainLayout from "../layouts/MainLayout";
+import WorkflowNav from "../components/WorkflowNav";
+import "./SourcePage.css";
+
+/* ------------------------------------------------------------------ */
+/*  API call — replace the body with the call your old handleSubmit   */
+/*  used (from src/api or src/services). It must return the new id.   */
+/* ------------------------------------------------------------------ */
+async function submitSource(
+  repoUrl: string,
+  branch: string
+): Promise<{ id: string | number }> {
+  const res = await fetch(`${import.meta.env.VITE_API_BASE_URL}/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ repo_url: repoUrl, branch }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body?.detail ?? `Request failed (${res.status})`);
+  }
+  return res.json();
+}
+
+/* Accepts https://host/owner/repo(.git) and git@host:owner/repo(.git) */
+const parseRepo = (url: string) => {
+  const u = url.trim();
+  const m =
+    u.match(/^https?:\/\/([^/\s]+)\/(.+?)\/([^/\s]+?)(?:\.git)?\/?$/i) ??
+    u.match(/^git@([^:\s]+):(.+?)\/([^/\s]+?)(?:\.git)?$/i);
+  return m ? { host: m[1], owner: m[2], name: m[3] } : null;
+};
+
+const GitIcon = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M10 14a3.5 3.5 0 0 0 5 0l3-3a3.5 3.5 0 0 0-5-5l-1 1" />
+    <path d="M14 10a3.5 3.5 0 0 0-5 0l-3 3a3.5 3.5 0 0 0 5 5l1-1" />
+  </svg>
+);
+
+const BranchIcon = () => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <circle cx="6" cy="5" r="2" />
+    <circle cx="6" cy="19" r="2" />
+    <circle cx="18" cy="7" r="2" />
+    <path d="M6 7v10M18 9c0 5-12 3-12 8" />
+  </svg>
+);
+
+export const SourcePage: React.FC = () => {
+  const navigate = useNavigate();
+  const { migrationId } = useParams();
+
+  const [repoUrl, setRepoUrl] = useState("");
+  const [branch, setBranch] = useState("main");
+  const [touched, setTouched] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const repo = useMemo(() => parseRepo(repoUrl), [repoUrl]);
+  const urlInvalid = touched && repoUrl.trim() !== "" && !repo;
+  const canSubmit = !!repo && branch.trim() !== "" && !isLoading;
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTouched(true);
+    if (!canSubmit) return;
+    setIsLoading(true);
+    setError(null);
+    try {
+      const created = await submitSource(repoUrl.trim(), branch.trim());
+      navigate(`/migration/${created.id}/scan`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <MainLayout
+      title="Migration Skill Factory"
+      subtitle="Connect a repository"
+      stepNumber={1}
+      totalSteps={5}
+      workflow={
+        <WorkflowNav
+          currentStep="source"
+          migrationId={migrationId}
+          disabled={isLoading}
+        />
+      }
+    >
+      <section className="src-card">
+        {/* Left: what happens */}
+        <div className="src-intro">
+          <span className="src-eyebrow">Step 1 · Source</span>
+          <h2>Connect a repository</h2>
+          <p>
+            Point the factory at a Git repository. We pull the branch, scan the
+            code and turn what we find into reusable skills for your coding
+            agent.
+          </p>
+
+          <ol className="src-flow">
+            <li>
+              <span className="src-flow-num">1</span>
+              <div>
+                <strong>Pull</strong>
+                <span>Clone the branch you choose</span>
+              </div>
+            </li>
+            <li>
+              <span className="src-flow-num">2</span>
+              <div>
+                <strong>Scan</strong>
+                <span>Map packages, versions and patterns</span>
+              </div>
+            </li>
+            <li>
+              <span className="src-flow-num">3</span>
+              <div>
+                <strong>Generate</strong>
+                <span>Skills plus a migration diff to review</span>
+              </div>
+            </li>
+          </ol>
+        </div>
+
+        {/* Right: the form */}
+        <form className="src-form" onSubmit={handleSubmit} noValidate>
+          <label htmlFor="repoUrl" className="src-label">
+            Repository URL <span className="src-req">*</span>
+          </label>
+          <div className={`src-input ${urlInvalid ? "is-invalid" : ""}`}>
+            <GitIcon />
+            <input
+              id="repoUrl"
+              type="text"
+              placeholder="https://github.com/org/repo.git"
+              value={repoUrl}
+              onChange={(e) => setRepoUrl(e.target.value)}
+              onBlur={() => setTouched(true)}
+              autoComplete="off"
+              spellCheck={false}
+              disabled={isLoading}
+              aria-invalid={urlInvalid}
+              aria-describedby="repoUrlHint"
+            />
+          </div>
+          <p id="repoUrlHint" className={`src-hint ${urlInvalid ? "is-error" : ""}`}>
+            {urlInvalid
+              ? "That doesn't look like a Git URL. Use HTTPS or SSH format."
+              : "HTTPS or SSH, e.g. git@github.com:org/repo.git"}
+          </p>
+
+          <label htmlFor="branch" className="src-label">
+            Branch <span className="src-req">*</span>
+          </label>
+          <div className="src-input">
+            <BranchIcon />
+            <input
+              id="branch"
+              type="text"
+              value={branch}
+              onChange={(e) => setBranch(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+              disabled={isLoading}
+            />
+          </div>
+
+          {repo && (
+            <div className="src-preview">
+              <span className="src-preview-host">{repo.host}</span>
+              <span className="src-preview-repo">
+                {repo.owner}/<strong>{repo.name}</strong>
+              </span>
+              <span className="src-preview-branch">@ {branch || "—"}</span>
+            </div>
+          )}
+
+          {error && (
+            <div className="src-error" role="alert">
+              {error}
+            </div>
+          )}
+
+          <button type="submit" className="src-submit" disabled={!canSubmit}>
+            {isLoading ? (
+              <>
+                <span className="src-spinner" /> Starting…
+              </>
+            ) : (
+              <>Start scan →</>
+            )}
+          </button>
+        </form>
+      </section>
+    </MainLayout>
+  );
+};
+
+export default SourcePage;
+
+
+
+/* Source / onboarding page — matches the MSF black + orange theme */
+:root {
+  --msf-orange: #d9541e;
+  --msf-orange-dark: #b8441a;
+  --msf-orange-soft: #fdf0e9;
+  --msf-black: #111111;
+  --msf-cream: #fbf8f4;
+  --msf-border: #e6e1da;
+  --msf-text: #1f1f1f;
+  --msf-muted: #6b6b6b;
+  --msf-error: #c0362c;
+}
+
+.src-card {
+  display: grid;
+  grid-template-columns: 1fr 1.15fr;
+  margin-top: 32px;
+  background: #fff;
+  border: 1px solid var(--msf-border);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.04);
+}
+
+/* ---------- Left panel ---------- */
+.src-intro {
+  position: relative;
+  padding: 40px 40px 44px;
+  background: var(--msf-black);
+  color: #fff;
+}
+
+.src-intro::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 6px;
+  background: var(--msf-orange);
+}
+
+.src-eyebrow {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--msf-orange);
+}
+
+.src-intro h2 {
+  margin: 10px 0 12px;
+  font-size: 28px;
+  line-height: 1.2;
+  font-weight: 700;
+}
+
+.src-intro p {
+  margin: 0;
+  max-width: 42ch;
+  color: #c9c9c9;
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+.src-flow {
+  list-style: none;
+  margin: 32px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 18px;
+}
+
+.src-flow li {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.src-flow-num {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1.5px solid var(--msf-orange);
+  color: var(--msf-orange);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.src-flow strong {
+  display: block;
+  font-size: 15px;
+}
+
+.src-flow span:not(.src-flow-num) {
+  font-size: 13px;
+  color: #a8a8a8;
+}
+
+/* ---------- Right panel (form) ---------- */
+.src-form {
+  padding: 40px 44px 44px;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+}
+
+.src-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--msf-text);
+  margin-bottom: 8px;
+}
+
+.src-label + .src-input {
+  margin-bottom: 6px;
+}
+
+.src-req {
+  color: var(--msf-orange);
+}
+
+.src-input {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 48px;
+  padding: 0 14px;
+  border: 1.5px solid var(--msf-border);
+  border-radius: 10px;
+  background: var(--msf-cream);
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+
+.src-input:focus-within {
+  background: #fff;
+  border-color: var(--msf-orange);
+  box-shadow: 0 0 0 3px rgba(217, 84, 30, 0.15);
+}
+
+.src-input.is-invalid {
+  border-color: var(--msf-error);
+}
+
+.src-input svg {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: var(--msf-muted);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.src-input:focus-within svg {
+  stroke: var(--msf-orange);
+}
+
+.src-input input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 14px;
+  color: var(--msf-text);
+}
+
+.src-input input::placeholder {
+  color: #a3a3a3;
+}
+
+.src-hint {
+  margin: 0 0 22px;
+  font-size: 12.5px;
+  color: var(--msf-muted);
+}
+
+.src-hint.is-error {
+  color: var(--msf-error);
+}
+
+/* Parsed repo preview */
+.src-preview {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 18px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--msf-orange-soft);
+  border: 1px dashed rgba(217, 84, 30, 0.4);
+  font-size: 14px;
+  color: var(--msf-text);
+}
+
+.src-preview-host {
+  font-size: 12px;
+  color: var(--msf-muted);
+}
+
+.src-preview-branch {
+  color: var(--msf-orange-dark);
+  font-weight: 600;
+}
+
+.src-error {
+  margin-top: 16px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: #fdecea;
+  color: var(--msf-error);
+  font-size: 14px;
+}
+
+/* Submit */
+.src-submit {
+  align-self: flex-start;
+  margin-top: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 48px;
+  padding: 0 28px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--msf-orange);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.05s;
+}
+
+.src-submit:hover:not(:disabled) {
+  background: var(--msf-orange-dark);
+}
+
+.src-submit:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.src-submit:disabled {
+  background: #e4b8a5;
+  cursor: not-allowed;
+}
+
+.src-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: src-spin 0.7s linear infinite;
+}
+
+@keyframes src-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------- Responsive ---------- */
+@media (max-width: 900px) {
+  .src-card {
+    grid-template-columns: 1fr;
+  }
+  .src-intro,
+  .src-form {
+    padding: 28px 24px 32px;
+  }
+}
