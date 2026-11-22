@@ -1,244 +1,670 @@
-/**
- * Minimal unified-diff parser.
- *
- * Hunk IDs are "<fileIndex>:<hunkIndex>", both 0-based in the order they
- * appear in full.diff. This MUST match the IDs produced by list_hunks()
- * in coder_agent/apply_review.py — verify once against a real run.
- */
+import React, { useEffect, useState } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+// Keep your existing import paths for these two:
+import MainLayout from "../layouts/MainLayout";
+import WorkflowNav from "../components/WorkflowNav";
+import { Job, jobState, useJobPolling } from "../hooks/useJobPolling";
+import "./ApprovalPage.css";
 
-export type DiffLine = {
-  type: "add" | "del" | "ctx" | "meta";
-  text: string;
-  oldNo?: number;
-  newNo?: number;
-};
+const API = import.meta.env.VITE_API_BASE_URL;
+const MAX = 2000;
 
-export type Hunk = {
-  id: string;
-  fileIndex: number;
-  hunkIndex: number;
-  header: string;
-  lines: DiffLine[];
-  adds: number;
-  dels: number;
-};
+const EXAMPLES = [
+  "Upgrade React from 17 to 18 and fix breaking changes",
+  "Replace moment.js with date-fns",
+  "Migrate class components to function components with hooks",
+  "Upgrade all internal @org packages to their latest major version",
+];
 
-export type FileDiff = {
-  index: number;
-  path: string;
-  oldPath: string | null;
-  newPath: string | null;
-  isNew: boolean;
-  isDeleted: boolean;
-  isBinary: boolean;
-  hunks: Hunk[];
-  adds: number;
-  dels: number;
-};
-
-const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
-const stripPrefix = (p: string) =>
-  p === "/dev/null" ? null : p.replace(/^[ab]\//, "").replace(/\t.*$/, "");
-
-export function parseDiff(text: string): FileDiff[] {
-  const files: FileDiff[] = [];
-  let file: FileDiff | null = null;
-  let hunk: Hunk | null = null;
-  let oldLeft = 0;
-  let newLeft = 0;
-  let oldNo = 0;
-  let newNo = 0;
-
-  const startFile = (path = "") => {
-    file = {
-      index: files.length,
-      path,
-      oldPath: null,
-      newPath: null,
-      isNew: false,
-      isDeleted: false,
-      isBinary: false,
-      hunks: [],
-      adds: 0,
-      dels: 0,
-    };
-    files.push(file);
-    hunk = null;
-  };
-
-  for (const raw of text.replace(/\r\n/g, "\n").split("\n")) {
-    // Inside a hunk: consume exactly the number of lines the header promised
-    if (hunk && file && (oldLeft > 0 || newLeft > 0)) {
-      const c = raw[0];
-      if (c === "+") {
-        hunk.lines.push({ type: "add", text: raw.slice(1), newNo: newNo++ });
-        hunk.adds++; file.adds++; newLeft--;
-        continue;
-      }
-      if (c === "-") {
-        hunk.lines.push({ type: "del", text: raw.slice(1), oldNo: oldNo++ });
-        hunk.dels++; file.dels++; oldLeft--;
-        continue;
-      }
-      if (c === " " || raw === "") {
-        hunk.lines.push({ type: "ctx", text: raw.slice(1), oldNo: oldNo++, newNo: newNo++ });
-        oldLeft--; newLeft--;
-        continue;
-      }
-      if (c === "\\") {
-        hunk.lines.push({ type: "meta", text: raw });
-        continue;
-      }
-      // malformed hunk: fall through and treat as a header line
-      oldLeft = newLeft = 0;
-    }
-    if (raw.startsWith("\\") && hunk) {
-      hunk.lines.push({ type: "meta", text: raw });
-      continue;
-    }
-
-    if (raw.startsWith("diff --git ")) {
-      const m = raw.match(/^diff --git a\/(.+?) b\/(.+)$/);
-      startFile(m ? m[2] : raw.slice(11));
-      continue;
-    }
-
-    if (raw.startsWith("--- ")) {
-      // plain unified diff without "diff --git" headers
-      if (!file || (file as FileDiff).hunks.length > 0) startFile();
-      file!.oldPath = stripPrefix(raw.slice(4));
-      continue;
-    }
-    if (raw.startsWith("+++ ") && file) {
-      file.newPath = stripPrefix(raw.slice(4));
-      file.path = file.newPath ?? file.oldPath ?? file.path;
-      file.isNew = file.oldPath === null && !!file.newPath;
-      file.isDeleted = file.newPath === null;
-      continue;
-    }
-
-    if (!file) continue;
-    if (raw.startsWith("new file mode")) file.isNew = true;
-    else if (raw.startsWith("deleted file mode")) file.isDeleted = true;
-    else if (raw.startsWith("Binary files")) file.isBinary = true;
-    else {
-      const m = raw.match(HUNK_RE);
-      if (m) {
-        const hunkIndex = file.hunks.length;
-        hunk = {
-          id: `${file.index}:${hunkIndex}`,
-          fileIndex: file.index,
-          hunkIndex,
-          header: raw,
-          lines: [],
-          adds: 0,
-          dels: 0,
-        };
-        file.hunks.push(hunk);
-        oldNo = +m[1];
-        newNo = +m[3];
-        oldLeft = m[2] === undefined ? 1 : +m[2];
-        newLeft = m[4] === undefined ? 1 : +m[4];
-      }
-    }
-  }
-
-  return files;
-}
-
-
-import { useCallback, useEffect, useRef, useState } from "react";
-
-export type Job = {
-  id: string;
-  project_name: string;
-  repository_url: string;
-  branch?: string | null;
-  description?: string | null;
-  progress_percentage: number | null;
-  status: string;
-  job_type?: string | null;
-  user_query?: string | null;
-  progress_message?: string | null;
+type JobWithPaths = Job & {
   local_repo_path?: string | null;
   output_path?: string | null;
-  coder_run_id?: string | null;
-  review_decision?: { action: "all" | "none" | "select"; accepted?: string[] } | null;
-  created_at: string;
-  updated_at: string;
 };
 
-const DONE = ["completed", "complete", "success", "succeeded", "done"];
-const FAILED = ["failed", "error", "cancelled", "canceled"];
-const REVIEW = ["waiting_for_review", "review"];
+export const ApprovalPage: React.FC = () => {
+  const navigate = useNavigate();
+  const { migrationId } = useParams();
 
-export const jobState = (status?: string) => {
-  const s = (status ?? "").toLowerCase();
-  if (DONE.includes(s)) return "done" as const;
-  if (FAILED.includes(s)) return "failed" as const;
-  if (REVIEW.includes(s)) return "review" as const;
-  if (["pending", "queued", "created", "new"].includes(s)) return "queued" as const;
-  return "running" as const;
-};
+  const [job, setJob] = useState<JobWithPaths | null>(null);
+  const [query, setQuery] = useState("");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
-/**
- * Fetches GET /jobs/{id} every `intervalMs` until the job completes, fails or
- * waits for review. Change `pollKey` to start polling again (e.g. after
- * submitting a review, when the job goes back to "queued").
- */
-export function useJobPolling(jobId?: string, intervalMs = 4000, pollKey: unknown = 0) {
-  const [job, setJob] = useState<Job | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [history, setHistory] = useState<{ at: string; message: string }[]>([]);
-  const timer = useRef<number | null>(null);
-
-  const fetchJob = useCallback(async () => {
-    if (!jobId) return null;
-    try {
-      // Adjust the path if your API uses a different one
-      const res = await fetch(`${import.meta.env.VITE_API_BASE_URL}/jobs/${jobId}`);
-      if (!res.ok) throw new Error(`Could not load job (${res.status})`);
-      const data: Job = await res.json();
-      setJob(data);
-      setError(null);
-      if (data.progress_message) {
-        setHistory((h) =>
-          h.length && h[h.length - 1].message === data.progress_message
-            ? h
-            : [...h, { at: data.updated_at, message: data.progress_message! }]
-        );
-      }
-      return data;
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not load job");
-      return null;
-    }
-  }, [jobId]);
-
-  // Clear the previous job's data when a different job is tracked
-  useEffect(() => {
-    setJob(null);
-    setHistory([]);
-  }, [jobId]);
+  // The code job being tracked lives in the URL (?codeJob=<id>) so a refresh keeps tracking it
+  const [searchParams, setSearchParams] = useSearchParams();
+  const codeJobId = searchParams.get("codeJob") ?? undefined;
+  const { job: codeJob, error: codeJobError, history } = useJobPolling(codeJobId, 4000);
+  const codeState = jobState(codeJob?.status);
+  const codePct = Math.max(0, Math.min(100, codeJob?.progress_percentage ?? 0));
+  const tracking = !!codeJobId;
+  const codeRunning = tracking && (codeState === "queued" || codeState === "running");
 
   useEffect(() => {
-    if (!jobId) return; // nothing to track yet
+    if (!migrationId) return;
     let cancelled = false;
-
-    const tick = async () => {
-      const data = await fetchJob();
-      if (cancelled) return;
-      const state = jobState(data?.status);
-      if (state === "done" || state === "failed" || state === "review") return; // stop polling
-      timer.current = window.setTimeout(tick, intervalMs);
-    };
-
-    tick();
+    fetch(`${API}/jobs/${migrationId}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`Could not load job (${r.status})`))))
+      .then((j) => !cancelled && setJob(j))
+      .catch((e) => !cancelled && setLoadError(e.message));
     return () => {
       cancelled = true;
-      if (timer.current) window.clearTimeout(timer.current);
     };
-  }, [fetchJob, intervalMs, pollKey]);
+  }, [migrationId]);
 
-  return { job, error, history, refresh: fetchJob };
+  const ready = !!job && jobState(job.status) === "done" && !!job.local_repo_path;
+  const canSubmit = ready && !tracking && query.trim().length >= 10 && !submitting;
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!job || !canSubmit) return;
+    setSubmitting(true);
+    setSubmitError(null);
+
+    try {
+      // New job = copy of the skill job + the change request, typed as "code"
+      const res = await fetch(`${API}/jobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_name: job.project_name,
+          repository_url: job.repository_url,
+          branch: job.branch || "main",
+          description: job.description ?? null,
+          local_repo_path: job.local_repo_path,
+          output_path: job.output_path ?? null,
+          job_type: "code",
+          user_query: query.trim(),
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(
+          typeof body?.detail === "string" ? body.detail : `Could not create the job (${res.status})`
+        );
+      }
+      const created: Job = await res.json();
+      setSearchParams({ codeJob: String(created.id) }); // stay here and track it
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <MainLayout
+      title="Migration Skill Factory"
+      subtitle="Describe the code change"
+      stepNumber={4}
+      totalSteps={5}
+      workflow={<WorkflowNav currentStep="approval" migrationId={migrationId} disabled={submitting || codeRunning} />}
+    >
+      <div className="ap-wrap">
+        {loadError && <div className="ap-alert">{loadError}</div>}
+        {!job && !loadError && <div className="ap-note">Loading…</div>}
+
+        {job && !ready && (
+          <div className="ap-note">
+            {jobState(job.status) !== "done"
+              ? "The skill job hasn't finished yet."
+              : "This job has no local repository path, so the coder agent has nothing to work on."}
+            <button className="ap-btn is-secondary" onClick={() => navigate(`/migration/${job.id}/scan`)}>
+              Back to scan
+            </button>
+          </div>
+        )}
+
+        {job && ready && (
+          <section className="ap-card">
+            {/* Left: what the coder agent will use */}
+            <aside className="ap-context">
+              <span className="ap-eyebrow">Step 4 · Approval</span>
+              <h2>{job.project_name}</h2>
+              <p className="ap-muted">
+                The coder agent applies your change to this repository, guided by the skill you just
+                reviewed, and produces a diff for you to validate.
+              </p>
+
+              <dl className="ap-meta">
+                <div>
+                  <dt>Repository</dt>
+                  <dd className="mono" title={job.repository_url}>{job.repository_url}</dd>
+                </div>
+                <div>
+                  <dt>Branch</dt>
+                  <dd className="mono">{job.branch || "main"}</dd>
+                </div>
+                <div>
+                  <dt>Working copy</dt>
+                  <dd className="mono" title={job.local_repo_path ?? ""}>{job.local_repo_path}</dd>
+                </div>
+                <div>
+                  <dt>Skill</dt>
+                  <dd className="ap-ok">✓ Reviewed</dd>
+                </div>
+              </dl>
+            </aside>
+
+            {/* Right: the change request */}
+            <form className="ap-form" onSubmit={handleSubmit}>
+              <label htmlFor="query" className="ap-label">
+                What should the coder agent change? <span className="ap-req">*</span>
+              </label>
+              <textarea
+                id="query"
+                className="ap-textarea"
+                placeholder="e.g. Upgrade the app from React 17 to 18. Replace ReactDOM.render with createRoot and fix any type errors."
+                value={tracking ? codeJob?.user_query ?? query : query}
+                onChange={(e) => setQuery(e.target.value)}
+                maxLength={MAX}
+                rows={8}
+                disabled={submitting || tracking}
+              />
+              <div className="ap-row">
+                <span className="ap-hint">Be specific: versions, packages, files or patterns to change.</span>
+                <span className="ap-hint">{query.length}/{MAX}</span>
+              </div>
+
+              <div className="ap-examples">
+                <span className="ap-hint">Examples</span>
+                <div>
+                  {EXAMPLES.map((ex) => (
+                    <button key={ex} type="button" className="ap-chip" onClick={() => setQuery(ex)} disabled={submitting || tracking}>
+                      {ex}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {submitError && <div className="ap-alert">{submitError}</div>}
+
+              {!tracking && (
+                <div className="ap-actions">
+                  <button type="button" className="ap-btn is-secondary" onClick={() => navigate(`/migration/${job.id}/assessment`)} disabled={submitting}>
+                    ← Back
+                  </button>
+                  <button type="submit" className="ap-btn" disabled={!canSubmit}>
+                    {submitting ? "Submitting…" : "Submit code change →"}
+                  </button>
+                </div>
+              )}
+
+              {/* ---------- Code job progress ---------- */}
+              {tracking && (
+                <div className={`ap-progress is-${codeState}`} aria-live="polite">
+                  <div className="ap-progress-top">
+                    <div>
+                      <span className="ap-hint">Code job</span>
+                      <div className="mono ap-jobid">{codeJobId}</div>
+                    </div>
+                    <span className={`ap-badge is-${codeState}`}>
+                      {codeRunning && <span className="ap-dot" />}
+                      {{ queued: "Queued", running: "Coding", review: "Ready for review", done: "Completed", failed: "Failed" }[codeState]}
+                    </span>
+                  </div>
+
+                  <div className="ap-bar-row">
+                    <div className="ap-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={codePct}>
+                      <div className="ap-bar-fill" style={{ width: `${codePct}%` }} />
+                    </div>
+                    <span className="ap-pct">{codePct}%</span>
+                  </div>
+
+                  <p className="ap-message">
+                    {codeJobError && !codeJob
+                      ? codeJobError
+                      : codeJob?.progress_message ||
+                        (codeState === "queued" ? "Waiting for the worker to pick up this job…" : "Working…")}
+                  </p>
+
+                  {history.length > 1 && (
+                    <ol className="ap-log">
+                      {history.slice(0, -1).reverse().slice(0, 5).map((h, i) => (
+                        <li key={`${h.at}-${i}`}>{h.message}</li>
+                      ))}
+                    </ol>
+                  )}
+
+                  <div className="ap-actions">
+                    {codeState === "failed" ? (
+                      <button type="button" className="ap-btn is-secondary" onClick={() => setSearchParams({})}>
+                        Edit request and retry
+                      </button>
+                    ) : (
+                      <span className="ap-hint">{codeRunning ? "Refreshing every 4 seconds" : ""}</span>
+                    )}
+                    <button
+                      type="button"
+                      className="ap-btn"
+                      disabled={codeState !== "review" && codeState !== "done"}
+                      onClick={() => navigate(`/migration/${codeJobId}/upgrade`)}
+                    >
+                      Review changes →
+                    </button>
+                  </div>
+                </div>
+              )}
+            </form>
+          </section>
+        )}
+      </div>
+    </MainLayout>
+  );
+};
+
+export default ApprovalPage;
+
+
+
+
+/* Approval page — uses the --msf-* variables from SourcePage.css */
+.ap-wrap {
+  width: 100%;
+  max-width: 1040px;
+  margin: 40px auto;
+  display: grid;
+  gap: 20px;
 }
+
+.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+
+.ap-alert {
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: #fdecea;
+  color: #c0362c;
+  font-size: 14px;
+}
+
+.ap-note {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 18px;
+  border-radius: 10px;
+  background: #fff;
+  border: 1px solid var(--msf-border, #e6e1da);
+  color: var(--msf-muted, #6b6b6b);
+  font-size: 14px;
+}
+
+.ap-card {
+  display: grid;
+  grid-template-columns: 1fr 1.35fr;
+  background: #fff;
+  border: 1px solid var(--msf-border, #e6e1da);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.04);
+}
+
+/* ---------- Left ---------- */
+.ap-context {
+  position: relative;
+  padding: 36px 34px;
+  background: var(--msf-black, #111);
+  color: #fff;
+}
+.ap-context::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 6px;
+  background: var(--msf-orange, #d9541e);
+}
+.ap-eyebrow {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--msf-orange, #d9541e);
+}
+.ap-context h2 { margin: 8px 0 10px; font-size: 24px; line-height: 1.25; word-break: break-word; }
+.ap-muted { margin: 0; color: #bdbdbd; font-size: 14px; line-height: 1.6; }
+
+.ap-meta { margin: 26px 0 0; display: grid; gap: 14px; }
+.ap-meta div { display: grid; gap: 3px; min-width: 0; }
+.ap-meta dt { font-size: 12px; color: #9a9a9a; }
+.ap-meta dd {
+  margin: 0;
+  font-size: 13.5px;
+  color: #fff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ap-ok { color: #7fd69a !important; font-weight: 600; }
+
+/* ---------- Right ---------- */
+.ap-form { padding: 36px 38px; display: flex; flex-direction: column; }
+
+.ap-label { font-size: 15px; font-weight: 600; margin-bottom: 10px; }
+.ap-req { color: var(--msf-orange, #d9541e); }
+
+.ap-textarea {
+  width: 100%;
+  min-height: 180px;
+  resize: vertical;
+  padding: 14px 16px;
+  border: 1.5px solid var(--msf-border, #e6e1da);
+  border-radius: 10px;
+  background: var(--msf-cream, #fbf8f4);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--msf-text, #1f1f1f);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+  box-sizing: border-box;
+}
+.ap-textarea:focus {
+  background: #fff;
+  border-color: var(--msf-orange, #d9541e);
+  box-shadow: 0 0 0 3px rgba(217, 84, 30, 0.15);
+}
+
+.ap-row { display: flex; justify-content: space-between; gap: 12px; margin-top: 6px; }
+.ap-hint { font-size: 12.5px; color: var(--msf-muted, #6b6b6b); }
+
+.ap-examples { margin-top: 20px; display: grid; gap: 8px; }
+.ap-examples > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.ap-chip {
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--msf-border, #e6e1da);
+  background: #fff;
+  font: inherit;
+  font-size: 13px;
+  color: var(--msf-text, #1f1f1f);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.ap-chip:hover:not(:disabled) {
+  border-color: var(--msf-orange, #d9541e);
+  background: var(--msf-orange-soft, #fdf0e9);
+}
+
+.ap-form .ap-alert { margin-top: 16px; }
+
+.ap-actions {
+  margin-top: 28px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ap-btn {
+  height: 46px;
+  padding: 0 24px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--msf-orange, #d9541e);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ap-btn:hover:not(:disabled) { background: var(--msf-orange-dark, #b8441a); }
+.ap-btn:disabled { background: #e4b8a5; cursor: not-allowed; }
+.ap-btn.is-secondary {
+  background: #fff;
+  color: var(--msf-text, #1f1f1f);
+  border: 1.5px solid var(--msf-border, #e6e1da);
+}
+.ap-btn.is-secondary:hover:not(:disabled) { border-color: var(--msf-orange, #d9541e); background: #fff; }
+.ap-btn.is-secondary:disabled { background: #fff; color: #aaa; }
+
+/* ---------- Code job progress ---------- */
+.ap-progress {
+  margin-top: 24px;
+  padding: 18px 20px;
+  border-radius: 12px;
+  border: 1px solid var(--msf-border, #e6e1da);
+  background: var(--msf-cream, #fbf8f4);
+}
+.ap-progress.is-failed { background: #fdf6f5; border-color: #f3c3be; }
+
+.ap-progress-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.ap-jobid { font-size: 12.5px; margin-top: 2px; word-break: break-all; }
+
+.ap-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.ap-badge.is-queued { background: #f1efec; color: #6b6b6b; }
+.ap-badge.is-running { background: #fdf0e9; color: #b8441a; }
+.ap-badge.is-review { background: #fdf0e9; color: #b8441a; }
+.ap-badge.is-done { background: #e8f5ec; color: #1e7a3c; }
+.ap-badge.is-failed { background: #fdecea; color: #c0362c; }
+.ap-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: currentColor;
+  animation: ap-pulse 1.2s ease-in-out infinite;
+}
+@keyframes ap-pulse { 50% { opacity: 0.3; } }
+
+.ap-bar-row { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+.ap-bar { flex: 1; height: 10px; border-radius: 999px; background: #ebe7e1; overflow: hidden; }
+.ap-bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--msf-orange, #d9541e);
+  transition: width 0.6s ease;
+}
+.ap-progress.is-running .ap-bar-fill {
+  background-image: linear-gradient(45deg, rgba(255,255,255,.22) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.22) 50%, rgba(255,255,255,.22) 75%, transparent 75%);
+  background-size: 18px 18px;
+  animation: ap-stripes 0.8s linear infinite;
+}
+.ap-progress.is-done .ap-bar-fill { background: #1e7a3c; }
+.ap-progress.is-failed .ap-bar-fill { background: #c0362c; }
+@keyframes ap-stripes { to { background-position: 18px 0; } }
+.ap-pct { font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; min-width: 42px; text-align: right; }
+
+.ap-message { margin: 12px 0 0; font-size: 14px; line-height: 1.5; }
+.ap-progress.is-failed .ap-message { color: #c0362c; }
+
+.ap-log {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0 0 0 12px;
+  border-left: 2px solid var(--msf-border, #e6e1da);
+  display: grid;
+  gap: 4px;
+  font-size: 12.5px;
+  color: var(--msf-muted, #6b6b6b);
+}
+
+.ap-progress .ap-actions { margin-top: 18px; align-items: center; }
+
+@media (max-width: 900px) {
+  .ap-card { grid-template-columns: 1fr; }
+  .ap-context, .ap-form { padding: 26px 22px; }
+}
+
+
+
+import React from "react";
+import { useNavigate, useParams } from "react-router-dom";
+// Keep your existing import paths for these two:
+import MainLayout from "../layouts/MainLayout";
+import WorkflowNav from "../components/WorkflowNav";
+import { useJobPolling, jobState } from "../hooks/useJobPolling";
+import "./ScanPage.css";
+
+const STATE_LABEL = {
+  queued: "Queued",
+  running: "Scanning",
+  review: "Awaiting review",
+  done: "Completed",
+  failed: "Failed",
+} as const;
+
+const formatTime = (iso?: string) =>
+  iso
+    ? new Date(iso).toLocaleString(undefined, {
+        day: "2-digit",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+      })
+    : "—";
+
+const repoLabel = (url?: string) =>
+  url?.replace(/^https?:\/\/|^git@/, "").replace(/\.git$/, "").replace(":", "/") ?? "—";
+
+export const ScanPage: React.FC = () => {
+  const navigate = useNavigate();
+  const { migrationId } = useParams();
+  const { job, error, history } = useJobPolling(migrationId, 4000);
+
+  const state = jobState(job?.status);
+  const pct = Math.max(0, Math.min(100, job?.progress_percentage ?? 0));
+  const isActive = state === "queued" || state === "running";
+
+  return (
+    <MainLayout
+      title="Migration Skill Factory"
+      subtitle="Scanning repository"
+      stepNumber={2}
+      totalSteps={5}
+      workflow={
+        <WorkflowNav
+          currentStep="scan"
+          migrationId={migrationId}
+          disabled={isActive}
+        />
+      }
+    >
+      <div className="scan-wrap">
+        {error && !job && (
+          <div className="scan-alert" role="alert">
+            {error}
+          </div>
+        )}
+
+        {!job && !error && <div className="scan-skeleton">Loading job…</div>}
+
+        {job && (
+          <>
+            {/* ---------- Job details ---------- */}
+            <section className="scan-card scan-details">
+              <div className="scan-details-head">
+                <div>
+                  <span className="scan-eyebrow">Application</span>
+                  <h2>{job.project_name}</h2>
+                </div>
+                <span className={`scan-badge is-${state}`}>
+                  {isActive && <span className="scan-dot" />}
+                  {STATE_LABEL[state]}
+                </span>
+              </div>
+
+              {job.description && <p className="scan-desc">{job.description}</p>}
+
+              <dl className="scan-meta">
+                <div>
+                  <dt>Repository</dt>
+                  <dd className="mono" title={job.repository_url}>
+                    {repoLabel(job.repository_url)}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Branch</dt>
+                  <dd className="mono">{job.branch || "main"}</dd>
+                </div>
+                <div>
+                  <dt>Job type</dt>
+                  <dd>{job.job_type || "—"}</dd>
+                </div>
+                <div>
+                  <dt>Started</dt>
+                  <dd>{formatTime(job.created_at)}</dd>
+                </div>
+                <div>
+                  <dt>Job ID</dt>
+                  <dd className="mono small">{job.id}</dd>
+                </div>
+              </dl>
+            </section>
+
+            {/* ---------- Progress ---------- */}
+            <section className="scan-card scan-progress">
+              <div className="scan-progress-top">
+                <h3>Progress</h3>
+                <span className="scan-pct">{pct}%</span>
+              </div>
+
+              <div
+                className={`scan-bar is-${state}`}
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={pct}
+              >
+                <div className="scan-bar-fill" style={{ width: `${pct}%` }} />
+              </div>
+
+              <p className={`scan-message is-${state}`} aria-live="polite">
+                {job.progress_message ||
+                  (state === "queued"
+                    ? "Waiting for a worker to pick up this job…"
+                    : "Working…")}
+              </p>
+
+              {history.length > 1 && (
+                <ol className="scan-log">
+                  {history
+                    .slice()
+                    .reverse()
+                    .map((h, i) => (
+                      <li key={`${h.at}-${i}`} className={i === 0 ? "is-latest" : ""}>
+                        <span className="scan-log-time">{formatTime(h.at)}</span>
+                        <span>{h.message}</span>
+                      </li>
+                    ))}
+                </ol>
+              )}
+
+              <div className="scan-footer">
+                <span className="scan-updated">
+                  {isActive
+                    ? "Refreshing every 4 seconds"
+                    : `Last updated ${formatTime(job.updated_at)}`}
+                </span>
+
+                {state === "done" && (
+                  <button
+                    className="scan-btn"
+                    onClick={() => navigate(`/migration/${job.id}/assessment`)}
+                  >
+                    Continue to Assessment →
+                  </button>
+                )}
+
+                {state === "failed" && (
+                  <button
+                    className="scan-btn is-secondary"
+                    onClick={() => navigate("/")}
+                  >
+                    Start a new scan
+                  </button>
+                )}
+              </div>
+            </section>
+          </>
+        )}
+      </div>
+    </MainLayout>
+  );
+};
+
+export default ScanPage;
