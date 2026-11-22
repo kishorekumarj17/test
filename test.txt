@@ -1,165 +1,577 @@
-# ===========================================================================
-# 1) MODEL  —  app/app/models/job.py   (then: alembic revision --autogenerate + upgrade)
-# ===========================================================================
-from sqlalchemy.dialects.postgresql import JSONB
+import React, { useEffect, useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+// Keep your existing import paths for these two:
+import MainLayout from "../layouts/MainLayout";
+import WorkflowNav from "../components/WorkflowNav";
+import { Job, jobState, useJobPolling } from "../hooks/useJobPolling";
+import { FileDiff, parseDiff } from "../utils/diffParser";
+import "./ReviewChangesPage.css";
 
-    # inside class Job(Base):
-    review_decision: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    # coder_run_id already exists (worker fills it after the coder run)
+const API = import.meta.env.VITE_API_BASE_URL;
+
+type Action = "all" | "none" | "select";
+
+const STATE_LABEL = {
+  queued: "Queued",
+  running: "Working",
+  review: "Ready for review",
+  done: "Completed",
+  failed: "Failed",
+} as const;
+
+/* ---------- small pieces ---------- */
+
+const Progress: React.FC<{ job: Job; title: string; history: { message: string }[] }> = ({ job, title, history }) => {
+  const state = jobState(job.status);
+  const pct = Math.max(0, Math.min(100, job.progress_percentage ?? 0));
+  return (
+    <section className={`rv-card rv-progress is-${state}`} aria-live="polite">
+      <div className="rv-progress-top">
+        <h3>{title}</h3>
+        <span className={`rv-badge is-${state}`}>{STATE_LABEL[state]}</span>
+      </div>
+      <div className="rv-bar-row">
+        <div className="rv-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
+          <div className="rv-bar-fill" style={{ width: `${pct}%` }} />
+        </div>
+        <span className="rv-pct">{pct}%</span>
+      </div>
+      <p className="rv-message">{job.progress_message || "Waiting for the worker…"}</p>
+      {history.length > 1 && (
+        <ol className="rv-log">
+          {history.slice(0, -1).reverse().slice(0, 5).map((h, i) => <li key={i}>{h.message}</li>)}
+        </ol>
+      )}
+    </section>
+  );
+};
+
+const Checkbox: React.FC<{
+  checked: boolean;
+  indeterminate?: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+  disabled?: boolean;
+}> = ({ checked, indeterminate = false, onChange, label, disabled }) => (
+  <input
+    type="checkbox"
+    className="rv-check"
+    aria-label={label}
+    checked={checked}
+    disabled={disabled}
+    ref={(el) => { if (el) el.indeterminate = indeterminate; }}
+    onChange={(e) => onChange(e.target.checked)}
+    onClick={(e) => e.stopPropagation()}
+  />
+);
+
+const describeDecision = (d?: Job["review_decision"]) =>
+  !d ? "" : d.action === "all" ? "All changes accepted"
+  : d.action === "none" ? "All changes discarded"
+  : `${d.accepted?.length ?? 0} hunk(s) accepted`;
+
+/* ---------- page ---------- */
+
+export const ReviewChangesPage: React.FC = () => {
+  const navigate = useNavigate();
+  const { migrationId } = useParams();
+
+  const [pollKey, setPollKey] = useState(0);
+  const { job, error, history } = useJobPolling(migrationId, 4000, pollKey);
+  const state = jobState(job?.status);
+
+  const [diffText, setDiffText] = useState<string | null>(null);
+  const [summary, setSummary] = useState<string | null>(null);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
+  // Load the diff once the coder run is waiting for review
+  useEffect(() => {
+    if (state !== "review" || diffText !== null || !migrationId) return;
+    (async () => {
+      try {
+        const [d, s] = await Promise.all([
+          fetch(`${API}/jobs/${migrationId}/artifacts/diff`),
+          fetch(`${API}/jobs/${migrationId}/artifacts/summary`),
+        ]);
+        if (!d.ok) throw new Error(`Could not load the diff (${d.status})`);
+        const text = await d.text();
+        setDiffText(text);
+        setSummary(s.ok ? await s.text() : null);
+        // default: everything selected
+        setSelected(new Set(parseDiff(text).flatMap((f) => f.hunks.map((h) => h.id))));
+      } catch (e) {
+        setDiffError(e instanceof Error ? e.message : "Could not load the diff");
+      }
+    })();
+  }, [state, diffText, migrationId]);
+
+  const files: FileDiff[] = useMemo(() => (diffText ? parseDiff(diffText) : []), [diffText]);
+  const allIds = useMemo(() => files.flatMap((f) => f.hunks.map((h) => h.id)), [files]);
+  const totals = useMemo(
+    () => files.reduce((t, f) => ({ adds: t.adds + f.adds, dels: t.dels + f.dels }), { adds: 0, dels: 0 }),
+    [files]
+  );
+
+  const action: Action =
+    selected.size === 0 ? "none" : selected.size === allIds.length ? "all" : "select";
+
+  const toggle = (ids: string[], on: boolean) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      ids.forEach((id) => (on ? next.add(id) : next.delete(id)));
+      return next;
+    });
+
+  const toggleCollapse = (i: number) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      next.has(i) ? next.delete(i) : next.add(i);
+      return next;
+    });
+
+  const submit = async (forced?: Action) => {
+    const act = forced ?? action;
+    if (act === "none" && !window.confirm("Discard all changes? Nothing will be applied to the repository.")) return;
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      const res = await fetch(`${API}/jobs/${migrationId}/review`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: act, accepted: act === "select" ? [...selected] : [] }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(typeof body?.detail === "string" ? body.detail : `Could not submit review (${res.status})`);
+      }
+      setPollKey((k) => k + 1); // job is queued again -> start polling
+    } catch (e) {
+      setSubmitError(e instanceof Error ? e.message : "Something went wrong");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const applying = !!job?.review_decision && (state === "queued" || state === "running");
+  const coding = !job?.review_decision && (state === "queued" || state === "running");
+
+  return (
+    <MainLayout
+      title="Migration Skill Factory"
+      subtitle="Review code changes"
+      stepNumber={5}
+      totalSteps={5}
+      workflow={<WorkflowNav currentStep="upgrade" migrationId={migrationId} disabled={submitting || applying} />}
+    >
+      <div className="rv-wrap">
+        {error && !job && <div className="rv-alert">{error}</div>}
+        {!job && !error && <div className="rv-note">Loading…</div>}
+
+        {job && coding && <Progress job={job} history={history} title="Coder agent is working" />}
+        {job && applying && <Progress job={job} history={history} title="Applying your selection" />}
+
+        {job && state === "failed" && (
+          <section className="rv-card rv-result is-failed">
+            <h3>Job failed</h3>
+            <p>{job.progress_message}</p>
+          </section>
+        )}
+
+        {/* ---------- Done ---------- */}
+        {job && state === "done" && (
+          <section className="rv-card rv-result is-done">
+            <span className="rv-eyebrow">Changes applied</span>
+            <h3>{describeDecision(job.review_decision)}</h3>
+            {job.progress_message && <p className="rv-message">{job.progress_message}</p>}
+            <p className="rv-hint">
+              Changes are in <span className="mono">{job.local_repo_path}</span> and are not committed yet.
+            </p>
+            <div className="rv-actions">
+              <button className="rv-btn" onClick={() => navigate(`/migration/${job.id}/validation`)}>
+                Continue to Validation →
+              </button>
+            </div>
+          </section>
+        )}
+
+        {/* ---------- Review ---------- */}
+        {job && state === "review" && (
+          <>
+            <section className="rv-summary">
+              <div>
+                <span className="rv-eyebrow">Review changes</span>
+                <h2>{job.project_name}</h2>
+                {job.user_query && <p className="rv-request">“{job.user_query}”</p>}
+              </div>
+              <div className="rv-stats">
+                <div><strong>{files.length}</strong><span>files</span></div>
+                <div><strong>{allIds.length}</strong><span>hunks</span></div>
+                <div><strong className="rv-add">+{totals.adds}</strong><span>added</span></div>
+                <div><strong className="rv-del">−{totals.dels}</strong><span>removed</span></div>
+              </div>
+            </section>
+
+            {summary && (
+              <details className="rv-card rv-agent-summary">
+                <summary>Coder agent summary</summary>
+                <pre>{summary}</pre>
+              </details>
+            )}
+
+            {diffError && <div className="rv-alert">{diffError}</div>}
+            {!diffText && !diffError && <div className="rv-note">Loading diff…</div>}
+            {diffText !== null && files.length === 0 && (
+              <div className="rv-note">The coder agent produced no changes.</div>
+            )}
+
+            {files.length > 0 && (
+              <>
+                <div className="rv-toolbar">
+                  <span>
+                    <strong>{selected.size}</strong> of {allIds.length} hunks selected
+                  </span>
+                  <div>
+                    <button className="rv-link" onClick={() => setSelected(new Set(allIds))}>Select all</button>
+                    <button className="rv-link" onClick={() => setSelected(new Set())}>Select none</button>
+                    <button className="rv-link" onClick={() => setCollapsed(new Set(files.map((f) => f.index)))}>Collapse all</button>
+                    <button className="rv-link" onClick={() => setCollapsed(new Set())}>Expand all</button>
+                  </div>
+                </div>
+
+                {files.map((f) => {
+                  const ids = f.hunks.map((h) => h.id);
+                  const on = ids.filter((id) => selected.has(id)).length;
+                  const isCollapsed = collapsed.has(f.index);
+                  return (
+                    <section key={f.index} className="rv-file">
+                      <header className="rv-file-head" onClick={() => toggleCollapse(f.index)}>
+                        <Checkbox
+                          label={`Select all hunks in ${f.path}`}
+                          checked={ids.length > 0 && on === ids.length}
+                          indeterminate={on > 0 && on < ids.length}
+                          disabled={ids.length === 0 || submitting}
+                          onChange={(v) => toggle(ids, v)}
+                        />
+                        <span className="rv-caret">{isCollapsed ? "▸" : "▾"}</span>
+                        <span className="mono rv-path">{f.path}</span>
+                        {f.isNew && <span className="rv-tag is-new">new</span>}
+                        {f.isDeleted && <span className="rv-tag is-del">deleted</span>}
+                        {f.isBinary && <span className="rv-tag">binary</span>}
+                        <span className="rv-counts">
+                          <span className="rv-add">+{f.adds}</span> <span className="rv-del">−{f.dels}</span>
+                        </span>
+                      </header>
+
+                      {!isCollapsed &&
+                        f.hunks.map((h) => {
+                          const isOn = selected.has(h.id);
+                          return (
+                            <div key={h.id} className={`rv-hunk ${isOn ? "" : "is-off"}`}>
+                              <div className="rv-hunk-head">
+                                <Checkbox
+                                  label={`Accept hunk ${h.id}`}
+                                  checked={isOn}
+                                  disabled={submitting}
+                                  onChange={(v) => toggle([h.id], v)}
+                                />
+                                <span className="mono">{h.header}</span>
+                                <span className="rv-hunk-id mono">{h.id}</span>
+                              </div>
+                              <table className="rv-lines">
+                                <tbody>
+                                  {h.lines.map((l, i) => (
+                                    <tr key={i} className={`is-${l.type}`}>
+                                      <td className="rv-no">{l.oldNo ?? ""}</td>
+                                      <td className="rv-no">{l.newNo ?? ""}</td>
+                                      <td className="rv-sign">{l.type === "add" ? "+" : l.type === "del" ? "−" : ""}</td>
+                                      <td className="rv-code">{l.text || " "}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          );
+                        })}
+                    </section>
+                  );
+                })}
+              </>
+            )}
+
+            {/* ---------- Decision bar ---------- */}
+            <section className="rv-footer">
+              <div className="rv-hint">
+                {action === "all" && "All changes will be applied."}
+                {action === "none" && "Nothing selected: all changes will be discarded."}
+                {action === "select" && `${selected.size} of ${allIds.length} hunks will be applied, the rest discarded.`}
+              </div>
+              {submitError && <div className="rv-alert">{submitError}</div>}
+              <div className="rv-actions">
+                <button className="rv-btn is-danger" disabled={submitting} onClick={() => submit("none")}>
+                  Discard all
+                </button>
+                <button className="rv-btn" disabled={submitting || diffText === null} onClick={() => submit()}>
+                  {submitting
+                    ? "Submitting…"
+                    : action === "all"
+                    ? "Accept all changes"
+                    : action === "none"
+                    ? "Discard all changes"
+                    : `Apply ${selected.size} selected`}
+                </button>
+              </div>
+            </section>
+          </>
+        )}
+      </div>
+    </MainLayout>
+  );
+};
+
+export default ReviewChangesPage;
 
 
-# ===========================================================================
-# 2) SCHEMAS  —  app/app/schemas/job.py
-# ===========================================================================
-import re
-from typing import Literal
 
-from pydantic import BaseModel, field_validator, model_validator
-
-HUNK_ID_RE = re.compile(r"^\d+:\d+$")
-
-
-class ReviewDecision(BaseModel):
-    action: Literal["all", "none", "select"]
-    accepted: list[str] = []
-
-    @field_validator("accepted")
-    @classmethod
-    def check_ids(cls, ids: list[str]) -> list[str]:
-        bad = [i for i in ids if not HUNK_ID_RE.match(i)]
-        if bad:
-            raise ValueError(f"Invalid hunk ids: {bad}. Expected '<file>:<hunk>', e.g. '0:2'")
-        return sorted(set(ids), key=lambda i: tuple(map(int, i.split(":"))))
-
-    @model_validator(mode="after")
-    def check_action(self):
-        if self.action == "select" and not self.accepted:
-            raise ValueError("Select at least one hunk, or use action 'none'")
-        if self.action != "select":
-            self.accepted = []
-        return self
-
-
-# add to JobRead:
-#     coder_run_id: str | None = None
-#     review_decision: dict | None = None
-
-
-# ===========================================================================
-# 3) API  —  jobs router
-# ===========================================================================
-import os
-from pathlib import Path
-
-from fastapi import Depends, HTTPException
-from fastapi.responses import FileResponse
-
-WAITING_FOR_REVIEW = "waiting_for_review"
-RUN_ID_RE = re.compile(r"^[\w-]+$")
-# e.g. C:\...\Migration-Skill-Factory\backend\output\coder_runs   (put it in app/.env)
-CODER_RUNS_ROOT = os.getenv("CODER_RUNS_ROOT")
-
-# Extend the ARTIFACTS dict from the assessment step:
-ARTIFACTS: dict[str, tuple[str, str]] = {
-    "skill": ("repository_skill.md", "text/markdown; charset=utf-8"),
-    "file-analysis": ("file_analysis.json", "application/json"),
-    "reading-plan": ("reading_plan.json", "application/json"),
-    # coder run files
-    "diff": ("full.diff", "text/plain; charset=utf-8"),
-    "summary": ("summary.txt", "text/plain; charset=utf-8"),
-    "accepted-patch": ("accepted.patch", "text/plain; charset=utf-8"),
+/* Review changes page — uses the --msf-* variables from SourcePage.css */
+.rv-wrap {
+  width: 100%;
+  max-width: 1100px;
+  margin: 40px auto;
+  display: grid;
+  gap: 16px;
 }
-CODER_ARTIFACTS = {"diff", "summary", "accepted-patch"}
 
+.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.rv-add { color: #1e7a3c; }
+.rv-del { color: #c0362c; }
 
-def artifact_dir(job, name: str) -> Path:
-    """Skill files live in job.output_path; coder files in coder_runs/<run_id>."""
-    if name in CODER_ARTIFACTS:
-        if not job.coder_run_id:
-            raise HTTPException(409, "This job has no coder run yet")
-        if not RUN_ID_RE.match(job.coder_run_id):
-            raise HTTPException(500, "Invalid coder_run_id on job")
-        if CODER_RUNS_ROOT:
-            return Path(CODER_RUNS_ROOT) / job.coder_run_id
-    if not job.output_path:
-        raise HTTPException(409, "This job has no output yet")
-    return Path(job.output_path)
+.rv-alert { padding: 12px 16px; border-radius: 10px; background: #fdecea; color: #c0362c; font-size: 14px; }
+.rv-note {
+  padding: 16px 18px;
+  border-radius: 10px;
+  background: #fff;
+  border: 1px solid var(--msf-border, #e6e1da);
+  color: var(--msf-muted, #6b6b6b);
+  font-size: 14px;
+}
+.rv-hint { font-size: 13px; color: var(--msf-muted, #6b6b6b); }
+.rv-eyebrow {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--msf-orange, #d9541e);
+}
 
+.rv-card {
+  background: #fff;
+  border: 1px solid var(--msf-border, #e6e1da);
+  border-radius: 14px;
+  padding: 24px 28px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.04);
+}
 
-# In get_job_artifact(), replace the two lines that build `path` with:
-#     filename, media_type = ARTIFACTS[name]
-#     path = artifact_dir(job, name) / filename
+/* ---------- Progress ---------- */
+.rv-progress-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.rv-progress h3 { margin: 0; font-size: 17px; }
+.rv-badge { padding: 5px 12px; border-radius: 999px; font-size: 12.5px; font-weight: 600; }
+.rv-badge.is-queued { background: #f1efec; color: #6b6b6b; }
+.rv-badge.is-running { background: #fdf0e9; color: #b8441a; }
+.rv-badge.is-review { background: #fdf0e9; color: #b8441a; }
+.rv-badge.is-done { background: #e8f5ec; color: #1e7a3c; }
+.rv-badge.is-failed { background: #fdecea; color: #c0362c; }
 
+.rv-bar-row { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+.rv-bar { flex: 1; height: 10px; border-radius: 999px; background: #ebe7e1; overflow: hidden; }
+.rv-bar-fill { height: 100%; border-radius: inherit; background: var(--msf-orange, #d9541e); transition: width 0.6s ease; }
+.rv-progress.is-running .rv-bar-fill {
+  background-image: linear-gradient(45deg, rgba(255,255,255,.22) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.22) 50%, rgba(255,255,255,.22) 75%, transparent 75%);
+  background-size: 18px 18px;
+  animation: rv-stripes 0.8s linear infinite;
+}
+@keyframes rv-stripes { to { background-position: 18px 0; } }
+.rv-pct { font-weight: 700; min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; }
+.rv-message { margin: 12px 0 0; font-size: 14px; line-height: 1.5; }
+.rv-log {
+  list-style: none;
+  margin: 10px 0 0;
+  padding-left: 12px;
+  border-left: 2px solid var(--msf-border, #e6e1da);
+  display: grid;
+  gap: 4px;
+  font-size: 12.5px;
+  color: var(--msf-muted, #6b6b6b);
+}
 
-@router.post("/{job_id}/review", response_model=JobRead)
-def submit_review(job_id: uuid.UUID, decision: ReviewDecision, db: Session = Depends(get_db)):
-    job = db.get(Job, job_id)                 # async: job = await db.get(Job, job_id)
-    if job is None:
-        raise HTTPException(404, "Job not found")
-    if (job.job_type or "").lower() != "code":
-        raise HTTPException(409, "Only code jobs can be reviewed")
-    if job.status != WAITING_FOR_REVIEW:
-        raise HTTPException(409, f"Job is '{job.status}', not waiting for review")
+/* ---------- Result ---------- */
+.rv-result h3 { margin: 6px 0 0; font-size: 20px; }
+.rv-result.is-done { border-left: 6px solid #1e7a3c; }
+.rv-result.is-failed { border-left: 6px solid #c0362c; }
+.rv-result.is-failed p { color: #c0362c; }
+.rv-result .rv-hint { margin-top: 10px; }
 
-    job.review_decision = decision.model_dump()
-    job.status = "queued"                     # worker picks it up again -> phase 2
-    job.progress_percentage = 0
-    job.progress_message = "Review submitted, waiting for the worker to apply changes"
-    db.commit()                               # async: await db.commit(); await db.refresh(job)
-    db.refresh(job)
-    return job
+/* ---------- Summary ---------- */
+.rv-summary {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+  padding: 24px 28px;
+  border-radius: 14px;
+  background: var(--msf-black, #111);
+  color: #fff;
+  overflow: hidden;
+}
+.rv-summary::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 6px;
+  background: var(--msf-orange, #d9541e);
+}
+.rv-summary h2 { margin: 6px 0 4px; font-size: 22px; }
+.rv-request { margin: 0; color: #c9c9c9; font-size: 14px; font-style: italic; max-width: 60ch; }
+.rv-stats { display: flex; gap: 22px; flex: none; }
+.rv-stats div { display: grid; text-align: right; }
+.rv-stats strong { font-size: 22px; font-variant-numeric: tabular-nums; }
+.rv-stats .rv-add { color: #7fd69a; }
+.rv-stats .rv-del { color: #ff8f84; }
+.rv-stats span { font-size: 12px; color: #a8a8a8; }
 
+.rv-agent-summary { padding: 14px 20px; }
+.rv-agent-summary summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+.rv-agent-summary pre {
+  margin: 12px 0 0;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+}
 
-# ===========================================================================
-# 4) WORKER  —  backend/job_worker/mainworker.py
-# ===========================================================================
-from coder_agent.apply_review import apply_accepted
+/* ---------- Toolbar ---------- */
+.rv-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 14px;
+}
+.rv-toolbar > div { display: flex; gap: 14px; }
+.rv-link {
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 13px;
+  color: var(--msf-orange-dark, #b8441a);
+  cursor: pointer;
+}
 
-WAITING_FOR_REVIEW = "waiting_for_review"
+/* ---------- Files & hunks ---------- */
+.rv-file {
+  background: #fff;
+  border: 1px solid var(--msf-border, #e6e1da);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.rv-file-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--msf-cream, #fbf8f4);
+  border-bottom: 1px solid var(--msf-border, #e6e1da);
+  cursor: pointer;
+  user-select: none;
+}
+.rv-caret { color: var(--msf-muted, #6b6b6b); width: 12px; }
+.rv-path { font-size: 13.5px; font-weight: 600; word-break: break-all; }
+.rv-tag {
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  background: #f1efec;
+  color: #6b6b6b;
+}
+.rv-tag.is-new { background: #e8f5ec; color: #1e7a3c; }
+.rv-tag.is-del { background: #fdecea; color: #c0362c; }
+.rv-counts { margin-left: auto; font-size: 13px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 
+.rv-check { width: 17px; height: 17px; accent-color: var(--msf-orange, #d9541e); cursor: pointer; flex: none; }
 
-def apply_review(job, report) -> None:
-    """Phase 2: apply only the hunks the user accepted."""
-    decision = job.review_decision or {"action": "none"}
-    if not job.coder_run_id or not job.local_repo_path:
-        raise ValueError("Job is missing coder_run_id or local_repo_path")
+.rv-hunk { border-top: 1px solid var(--msf-border, #e6e1da); }
+.rv-hunk:first-of-type { border-top: 0; }
+.rv-hunk-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+  background: #f3f0fa;
+  color: #5a4a8a;
+  font-size: 12.5px;
+}
+.rv-hunk-id { margin-left: auto; color: #8a80a8; }
+.rv-hunk.is-off .rv-lines { opacity: 0.4; }
+.rv-hunk.is-off .rv-hunk-head { background: #f4f4f4; color: #999; }
 
-    label = {
-        "all": "all changes",
-        "none": "no changes (discarding)",
-        "select": f"{len(decision.get('accepted', []))} selected hunk(s)",
-    }.get(decision.get("action"), "changes")
-    report(20, "review", f"Applying {label}")
+.rv-lines {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  table-layout: fixed;
+}
+.rv-lines td { padding: 0 8px; vertical-align: top; }
+.rv-no { width: 44px; text-align: right; color: #aaa; user-select: none; }
+.rv-sign { width: 14px; user-select: none; }
+.rv-code { white-space: pre-wrap; word-break: break-all; }
+.rv-lines tr.is-add { background: #e9f7ee; }
+.rv-lines tr.is-add .rv-sign { color: #1e7a3c; }
+.rv-lines tr.is-del { background: #fdeeed; }
+.rv-lines tr.is-del .rv-sign { color: #c0362c; }
+.rv-lines tr.is-meta td { color: #999; font-style: italic; }
 
-    result = apply_accepted(
-        run_id=job.coder_run_id,
-        repo_path=job.local_repo_path,
-        decision=decision,
-    )
+/* ---------- Footer ---------- */
+.rv-footer {
+  position: sticky;
+  bottom: 16px;
+  display: grid;
+  gap: 10px;
+  padding: 16px 22px;
+  background: #fff;
+  border: 1px solid var(--msf-border, #e6e1da);
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+}
+.rv-actions { display: flex; justify-content: flex-end; gap: 12px; flex-wrap: wrap; margin-top: 6px; }
+.rv-footer .rv-actions { margin-top: 0; }
 
-    message = result if isinstance(result, str) else getattr(result, "message", None)
-    update_job(
-        job.id,
-        status=COMPLETED,
-        progress_percentage=100,
-        progress_message=(message or f"Applied {label}")[:2000],
-    )
+.rv-btn {
+  height: 44px;
+  padding: 0 22px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--msf-orange, #d9541e);
+  color: #fff;
+  font-size: 14.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.rv-btn:hover:not(:disabled) { background: var(--msf-orange-dark, #b8441a); }
+.rv-btn:disabled { background: #e4b8a5; cursor: not-allowed; }
+.rv-btn.is-danger { background: #fff; color: #c0362c; border: 1.5px solid #f3c3be; }
+.rv-btn.is-danger:hover:not(:disabled) { background: #fdecea; }
+.rv-btn.is-danger:disabled { color: #ddd; border-color: #eee; background: #fff; }
 
-
-# --- in process_job(), FIRST thing inside try: -------------------------------
-#     if is_code_job(job) and job.review_decision is not None:
-#         apply_review(job, report)          # phase 2
-#         return
-#
-# --- in the success branch of "# 3. result", for code jobs use: -------------
-#     if is_code_job(job):
-#         update_job(
-#             job_id,
-#             status=WAITING_FOR_REVIEW,      # phase 1 done, wait for the user
-#             progress_percentage=100,
-#             progress_message="Diff ready for review",
-#             output_path=str(output_path) if output_path else job.output_path,
-#             # coder_run_id=...  (keep whatever line you already have that sets it)
-#         )
-#     else:
-#         update_job(job_id, status=COMPLETED, ...)   # skill jobs unchanged
+@media (max-width: 760px) {
+  .rv-summary { flex-direction: column; align-items: flex-start; }
+  .rv-stats div { text-align: left; }
+  .rv-no { width: 32px; }
+}
