@@ -1,577 +1,244 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
-// Keep your existing import paths for these two:
-import MainLayout from "../layouts/MainLayout";
-import WorkflowNav from "../components/WorkflowNav";
-import { Job, jobState, useJobPolling } from "../hooks/useJobPolling";
-import { FileDiff, parseDiff } from "../utils/diffParser";
-import "./ReviewChangesPage.css";
+/**
+ * Minimal unified-diff parser.
+ *
+ * Hunk IDs are "<fileIndex>:<hunkIndex>", both 0-based in the order they
+ * appear in full.diff. This MUST match the IDs produced by list_hunks()
+ * in coder_agent/apply_review.py — verify once against a real run.
+ */
 
-const API = import.meta.env.VITE_API_BASE_URL;
-
-type Action = "all" | "none" | "select";
-
-const STATE_LABEL = {
-  queued: "Queued",
-  running: "Working",
-  review: "Ready for review",
-  done: "Completed",
-  failed: "Failed",
-} as const;
-
-/* ---------- small pieces ---------- */
-
-const Progress: React.FC<{ job: Job; title: string; history: { message: string }[] }> = ({ job, title, history }) => {
-  const state = jobState(job.status);
-  const pct = Math.max(0, Math.min(100, job.progress_percentage ?? 0));
-  return (
-    <section className={`rv-card rv-progress is-${state}`} aria-live="polite">
-      <div className="rv-progress-top">
-        <h3>{title}</h3>
-        <span className={`rv-badge is-${state}`}>{STATE_LABEL[state]}</span>
-      </div>
-      <div className="rv-bar-row">
-        <div className="rv-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
-          <div className="rv-bar-fill" style={{ width: `${pct}%` }} />
-        </div>
-        <span className="rv-pct">{pct}%</span>
-      </div>
-      <p className="rv-message">{job.progress_message || "Waiting for the worker…"}</p>
-      {history.length > 1 && (
-        <ol className="rv-log">
-          {history.slice(0, -1).reverse().slice(0, 5).map((h, i) => <li key={i}>{h.message}</li>)}
-        </ol>
-      )}
-    </section>
-  );
+export type DiffLine = {
+  type: "add" | "del" | "ctx" | "meta";
+  text: string;
+  oldNo?: number;
+  newNo?: number;
 };
 
-const Checkbox: React.FC<{
-  checked: boolean;
-  indeterminate?: boolean;
-  onChange: (v: boolean) => void;
-  label: string;
-  disabled?: boolean;
-}> = ({ checked, indeterminate = false, onChange, label, disabled }) => (
-  <input
-    type="checkbox"
-    className="rv-check"
-    aria-label={label}
-    checked={checked}
-    disabled={disabled}
-    ref={(el) => { if (el) el.indeterminate = indeterminate; }}
-    onChange={(e) => onChange(e.target.checked)}
-    onClick={(e) => e.stopPropagation()}
-  />
-);
+export type Hunk = {
+  id: string;
+  fileIndex: number;
+  hunkIndex: number;
+  header: string;
+  lines: DiffLine[];
+  adds: number;
+  dels: number;
+};
 
-const describeDecision = (d?: Job["review_decision"]) =>
-  !d ? "" : d.action === "all" ? "All changes accepted"
-  : d.action === "none" ? "All changes discarded"
-  : `${d.accepted?.length ?? 0} hunk(s) accepted`;
+export type FileDiff = {
+  index: number;
+  path: string;
+  oldPath: string | null;
+  newPath: string | null;
+  isNew: boolean;
+  isDeleted: boolean;
+  isBinary: boolean;
+  hunks: Hunk[];
+  adds: number;
+  dels: number;
+};
 
-/* ---------- page ---------- */
+const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+const stripPrefix = (p: string) =>
+  p === "/dev/null" ? null : p.replace(/^[ab]\//, "").replace(/\t.*$/, "");
 
-export const ReviewChangesPage: React.FC = () => {
-  const navigate = useNavigate();
-  const { migrationId } = useParams();
+export function parseDiff(text: string): FileDiff[] {
+  const files: FileDiff[] = [];
+  let file: FileDiff | null = null;
+  let hunk: Hunk | null = null;
+  let oldLeft = 0;
+  let newLeft = 0;
+  let oldNo = 0;
+  let newNo = 0;
 
-  const [pollKey, setPollKey] = useState(0);
-  const { job, error, history } = useJobPolling(migrationId, 4000, pollKey);
-  const state = jobState(job?.status);
-
-  const [diffText, setDiffText] = useState<string | null>(null);
-  const [summary, setSummary] = useState<string | null>(null);
-  const [diffError, setDiffError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
-  const [submitting, setSubmitting] = useState(false);
-  const [submitError, setSubmitError] = useState<string | null>(null);
-
-  // Load the diff once the coder run is waiting for review
-  useEffect(() => {
-    if (state !== "review" || diffText !== null || !migrationId) return;
-    (async () => {
-      try {
-        const [d, s] = await Promise.all([
-          fetch(`${API}/jobs/${migrationId}/artifacts/diff`),
-          fetch(`${API}/jobs/${migrationId}/artifacts/summary`),
-        ]);
-        if (!d.ok) throw new Error(`Could not load the diff (${d.status})`);
-        const text = await d.text();
-        setDiffText(text);
-        setSummary(s.ok ? await s.text() : null);
-        // default: everything selected
-        setSelected(new Set(parseDiff(text).flatMap((f) => f.hunks.map((h) => h.id))));
-      } catch (e) {
-        setDiffError(e instanceof Error ? e.message : "Could not load the diff");
-      }
-    })();
-  }, [state, diffText, migrationId]);
-
-  const files: FileDiff[] = useMemo(() => (diffText ? parseDiff(diffText) : []), [diffText]);
-  const allIds = useMemo(() => files.flatMap((f) => f.hunks.map((h) => h.id)), [files]);
-  const totals = useMemo(
-    () => files.reduce((t, f) => ({ adds: t.adds + f.adds, dels: t.dels + f.dels }), { adds: 0, dels: 0 }),
-    [files]
-  );
-
-  const action: Action =
-    selected.size === 0 ? "none" : selected.size === allIds.length ? "all" : "select";
-
-  const toggle = (ids: string[], on: boolean) =>
-    setSelected((prev) => {
-      const next = new Set(prev);
-      ids.forEach((id) => (on ? next.add(id) : next.delete(id)));
-      return next;
-    });
-
-  const toggleCollapse = (i: number) =>
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      next.has(i) ? next.delete(i) : next.add(i);
-      return next;
-    });
-
-  const submit = async (forced?: Action) => {
-    const act = forced ?? action;
-    if (act === "none" && !window.confirm("Discard all changes? Nothing will be applied to the repository.")) return;
-    setSubmitting(true);
-    setSubmitError(null);
-    try {
-      const res = await fetch(`${API}/jobs/${migrationId}/review`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: act, accepted: act === "select" ? [...selected] : [] }),
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(typeof body?.detail === "string" ? body.detail : `Could not submit review (${res.status})`);
-      }
-      setPollKey((k) => k + 1); // job is queued again -> start polling
-    } catch (e) {
-      setSubmitError(e instanceof Error ? e.message : "Something went wrong");
-    } finally {
-      setSubmitting(false);
-    }
+  const startFile = (path = "") => {
+    file = {
+      index: files.length,
+      path,
+      oldPath: null,
+      newPath: null,
+      isNew: false,
+      isDeleted: false,
+      isBinary: false,
+      hunks: [],
+      adds: 0,
+      dels: 0,
+    };
+    files.push(file);
+    hunk = null;
   };
 
-  const applying = !!job?.review_decision && (state === "queued" || state === "running");
-  const coding = !job?.review_decision && (state === "queued" || state === "running");
+  for (const raw of text.replace(/\r\n/g, "\n").split("\n")) {
+    // Inside a hunk: consume exactly the number of lines the header promised
+    if (hunk && file && (oldLeft > 0 || newLeft > 0)) {
+      const c = raw[0];
+      if (c === "+") {
+        hunk.lines.push({ type: "add", text: raw.slice(1), newNo: newNo++ });
+        hunk.adds++; file.adds++; newLeft--;
+        continue;
+      }
+      if (c === "-") {
+        hunk.lines.push({ type: "del", text: raw.slice(1), oldNo: oldNo++ });
+        hunk.dels++; file.dels++; oldLeft--;
+        continue;
+      }
+      if (c === " " || raw === "") {
+        hunk.lines.push({ type: "ctx", text: raw.slice(1), oldNo: oldNo++, newNo: newNo++ });
+        oldLeft--; newLeft--;
+        continue;
+      }
+      if (c === "\\") {
+        hunk.lines.push({ type: "meta", text: raw });
+        continue;
+      }
+      // malformed hunk: fall through and treat as a header line
+      oldLeft = newLeft = 0;
+    }
+    if (raw.startsWith("\\") && hunk) {
+      hunk.lines.push({ type: "meta", text: raw });
+      continue;
+    }
 
-  return (
-    <MainLayout
-      title="Migration Skill Factory"
-      subtitle="Review code changes"
-      stepNumber={5}
-      totalSteps={5}
-      workflow={<WorkflowNav currentStep="upgrade" migrationId={migrationId} disabled={submitting || applying} />}
-    >
-      <div className="rv-wrap">
-        {error && !job && <div className="rv-alert">{error}</div>}
-        {!job && !error && <div className="rv-note">Loading…</div>}
+    if (raw.startsWith("diff --git ")) {
+      const m = raw.match(/^diff --git a\/(.+?) b\/(.+)$/);
+      startFile(m ? m[2] : raw.slice(11));
+      continue;
+    }
 
-        {job && coding && <Progress job={job} history={history} title="Coder agent is working" />}
-        {job && applying && <Progress job={job} history={history} title="Applying your selection" />}
+    if (raw.startsWith("--- ")) {
+      // plain unified diff without "diff --git" headers
+      if (!file || (file as FileDiff).hunks.length > 0) startFile();
+      file!.oldPath = stripPrefix(raw.slice(4));
+      continue;
+    }
+    if (raw.startsWith("+++ ") && file) {
+      file.newPath = stripPrefix(raw.slice(4));
+      file.path = file.newPath ?? file.oldPath ?? file.path;
+      file.isNew = file.oldPath === null && !!file.newPath;
+      file.isDeleted = file.newPath === null;
+      continue;
+    }
 
-        {job && state === "failed" && (
-          <section className="rv-card rv-result is-failed">
-            <h3>Job failed</h3>
-            <p>{job.progress_message}</p>
-          </section>
-        )}
+    if (!file) continue;
+    if (raw.startsWith("new file mode")) file.isNew = true;
+    else if (raw.startsWith("deleted file mode")) file.isDeleted = true;
+    else if (raw.startsWith("Binary files")) file.isBinary = true;
+    else {
+      const m = raw.match(HUNK_RE);
+      if (m) {
+        const hunkIndex = file.hunks.length;
+        hunk = {
+          id: `${file.index}:${hunkIndex}`,
+          fileIndex: file.index,
+          hunkIndex,
+          header: raw,
+          lines: [],
+          adds: 0,
+          dels: 0,
+        };
+        file.hunks.push(hunk);
+        oldNo = +m[1];
+        newNo = +m[3];
+        oldLeft = m[2] === undefined ? 1 : +m[2];
+        newLeft = m[4] === undefined ? 1 : +m[4];
+      }
+    }
+  }
 
-        {/* ---------- Done ---------- */}
-        {job && state === "done" && (
-          <section className="rv-card rv-result is-done">
-            <span className="rv-eyebrow">Changes applied</span>
-            <h3>{describeDecision(job.review_decision)}</h3>
-            {job.progress_message && <p className="rv-message">{job.progress_message}</p>}
-            <p className="rv-hint">
-              Changes are in <span className="mono">{job.local_repo_path}</span> and are not committed yet.
-            </p>
-            <div className="rv-actions">
-              <button className="rv-btn" onClick={() => navigate(`/migration/${job.id}/validation`)}>
-                Continue to Validation →
-              </button>
-            </div>
-          </section>
-        )}
+  return files;
+}
 
-        {/* ---------- Review ---------- */}
-        {job && state === "review" && (
-          <>
-            <section className="rv-summary">
-              <div>
-                <span className="rv-eyebrow">Review changes</span>
-                <h2>{job.project_name}</h2>
-                {job.user_query && <p className="rv-request">“{job.user_query}”</p>}
-              </div>
-              <div className="rv-stats">
-                <div><strong>{files.length}</strong><span>files</span></div>
-                <div><strong>{allIds.length}</strong><span>hunks</span></div>
-                <div><strong className="rv-add">+{totals.adds}</strong><span>added</span></div>
-                <div><strong className="rv-del">−{totals.dels}</strong><span>removed</span></div>
-              </div>
-            </section>
 
-            {summary && (
-              <details className="rv-card rv-agent-summary">
-                <summary>Coder agent summary</summary>
-                <pre>{summary}</pre>
-              </details>
-            )}
+import { useCallback, useEffect, useRef, useState } from "react";
 
-            {diffError && <div className="rv-alert">{diffError}</div>}
-            {!diffText && !diffError && <div className="rv-note">Loading diff…</div>}
-            {diffText !== null && files.length === 0 && (
-              <div className="rv-note">The coder agent produced no changes.</div>
-            )}
-
-            {files.length > 0 && (
-              <>
-                <div className="rv-toolbar">
-                  <span>
-                    <strong>{selected.size}</strong> of {allIds.length} hunks selected
-                  </span>
-                  <div>
-                    <button className="rv-link" onClick={() => setSelected(new Set(allIds))}>Select all</button>
-                    <button className="rv-link" onClick={() => setSelected(new Set())}>Select none</button>
-                    <button className="rv-link" onClick={() => setCollapsed(new Set(files.map((f) => f.index)))}>Collapse all</button>
-                    <button className="rv-link" onClick={() => setCollapsed(new Set())}>Expand all</button>
-                  </div>
-                </div>
-
-                {files.map((f) => {
-                  const ids = f.hunks.map((h) => h.id);
-                  const on = ids.filter((id) => selected.has(id)).length;
-                  const isCollapsed = collapsed.has(f.index);
-                  return (
-                    <section key={f.index} className="rv-file">
-                      <header className="rv-file-head" onClick={() => toggleCollapse(f.index)}>
-                        <Checkbox
-                          label={`Select all hunks in ${f.path}`}
-                          checked={ids.length > 0 && on === ids.length}
-                          indeterminate={on > 0 && on < ids.length}
-                          disabled={ids.length === 0 || submitting}
-                          onChange={(v) => toggle(ids, v)}
-                        />
-                        <span className="rv-caret">{isCollapsed ? "▸" : "▾"}</span>
-                        <span className="mono rv-path">{f.path}</span>
-                        {f.isNew && <span className="rv-tag is-new">new</span>}
-                        {f.isDeleted && <span className="rv-tag is-del">deleted</span>}
-                        {f.isBinary && <span className="rv-tag">binary</span>}
-                        <span className="rv-counts">
-                          <span className="rv-add">+{f.adds}</span> <span className="rv-del">−{f.dels}</span>
-                        </span>
-                      </header>
-
-                      {!isCollapsed &&
-                        f.hunks.map((h) => {
-                          const isOn = selected.has(h.id);
-                          return (
-                            <div key={h.id} className={`rv-hunk ${isOn ? "" : "is-off"}`}>
-                              <div className="rv-hunk-head">
-                                <Checkbox
-                                  label={`Accept hunk ${h.id}`}
-                                  checked={isOn}
-                                  disabled={submitting}
-                                  onChange={(v) => toggle([h.id], v)}
-                                />
-                                <span className="mono">{h.header}</span>
-                                <span className="rv-hunk-id mono">{h.id}</span>
-                              </div>
-                              <table className="rv-lines">
-                                <tbody>
-                                  {h.lines.map((l, i) => (
-                                    <tr key={i} className={`is-${l.type}`}>
-                                      <td className="rv-no">{l.oldNo ?? ""}</td>
-                                      <td className="rv-no">{l.newNo ?? ""}</td>
-                                      <td className="rv-sign">{l.type === "add" ? "+" : l.type === "del" ? "−" : ""}</td>
-                                      <td className="rv-code">{l.text || " "}</td>
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </table>
-                            </div>
-                          );
-                        })}
-                    </section>
-                  );
-                })}
-              </>
-            )}
-
-            {/* ---------- Decision bar ---------- */}
-            <section className="rv-footer">
-              <div className="rv-hint">
-                {action === "all" && "All changes will be applied."}
-                {action === "none" && "Nothing selected: all changes will be discarded."}
-                {action === "select" && `${selected.size} of ${allIds.length} hunks will be applied, the rest discarded.`}
-              </div>
-              {submitError && <div className="rv-alert">{submitError}</div>}
-              <div className="rv-actions">
-                <button className="rv-btn is-danger" disabled={submitting} onClick={() => submit("none")}>
-                  Discard all
-                </button>
-                <button className="rv-btn" disabled={submitting || diffText === null} onClick={() => submit()}>
-                  {submitting
-                    ? "Submitting…"
-                    : action === "all"
-                    ? "Accept all changes"
-                    : action === "none"
-                    ? "Discard all changes"
-                    : `Apply ${selected.size} selected`}
-                </button>
-              </div>
-            </section>
-          </>
-        )}
-      </div>
-    </MainLayout>
-  );
+export type Job = {
+  id: string;
+  project_name: string;
+  repository_url: string;
+  branch?: string | null;
+  description?: string | null;
+  progress_percentage: number | null;
+  status: string;
+  job_type?: string | null;
+  user_query?: string | null;
+  progress_message?: string | null;
+  local_repo_path?: string | null;
+  output_path?: string | null;
+  coder_run_id?: string | null;
+  review_decision?: { action: "all" | "none" | "select"; accepted?: string[] } | null;
+  created_at: string;
+  updated_at: string;
 };
 
-export default ReviewChangesPage;
+const DONE = ["completed", "complete", "success", "succeeded", "done"];
+const FAILED = ["failed", "error", "cancelled", "canceled"];
+const REVIEW = ["waiting_for_review", "review"];
 
+export const jobState = (status?: string) => {
+  const s = (status ?? "").toLowerCase();
+  if (DONE.includes(s)) return "done" as const;
+  if (FAILED.includes(s)) return "failed" as const;
+  if (REVIEW.includes(s)) return "review" as const;
+  if (["pending", "queued", "created", "new"].includes(s)) return "queued" as const;
+  return "running" as const;
+};
 
+/**
+ * Fetches GET /jobs/{id} every `intervalMs` until the job completes, fails or
+ * waits for review. Change `pollKey` to start polling again (e.g. after
+ * submitting a review, when the job goes back to "queued").
+ */
+export function useJobPolling(jobId?: string, intervalMs = 4000, pollKey: unknown = 0) {
+  const [job, setJob] = useState<Job | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [history, setHistory] = useState<{ at: string; message: string }[]>([]);
+  const timer = useRef<number | null>(null);
 
-/* Review changes page — uses the --msf-* variables from SourcePage.css */
-.rv-wrap {
-  width: 100%;
-  max-width: 1100px;
-  margin: 40px auto;
-  display: grid;
-  gap: 16px;
-}
+  const fetchJob = useCallback(async () => {
+    if (!jobId) return null;
+    try {
+      // Adjust the path if your API uses a different one
+      const res = await fetch(`${import.meta.env.VITE_API_BASE_URL}/jobs/${jobId}`);
+      if (!res.ok) throw new Error(`Could not load job (${res.status})`);
+      const data: Job = await res.json();
+      setJob(data);
+      setError(null);
+      if (data.progress_message) {
+        setHistory((h) =>
+          h.length && h[h.length - 1].message === data.progress_message
+            ? h
+            : [...h, { at: data.updated_at, message: data.progress_message! }]
+        );
+      }
+      return data;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load job");
+      return null;
+    }
+  }, [jobId]);
 
-.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-.rv-add { color: #1e7a3c; }
-.rv-del { color: #c0362c; }
+  // Clear the previous job's data when a different job is tracked
+  useEffect(() => {
+    setJob(null);
+    setHistory([]);
+  }, [jobId]);
 
-.rv-alert { padding: 12px 16px; border-radius: 10px; background: #fdecea; color: #c0362c; font-size: 14px; }
-.rv-note {
-  padding: 16px 18px;
-  border-radius: 10px;
-  background: #fff;
-  border: 1px solid var(--msf-border, #e6e1da);
-  color: var(--msf-muted, #6b6b6b);
-  font-size: 14px;
-}
-.rv-hint { font-size: 13px; color: var(--msf-muted, #6b6b6b); }
-.rv-eyebrow {
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--msf-orange, #d9541e);
-}
+  useEffect(() => {
+    if (!jobId) return; // nothing to track yet
+    let cancelled = false;
 
-.rv-card {
-  background: #fff;
-  border: 1px solid var(--msf-border, #e6e1da);
-  border-radius: 14px;
-  padding: 24px 28px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.04);
-}
+    const tick = async () => {
+      const data = await fetchJob();
+      if (cancelled) return;
+      const state = jobState(data?.status);
+      if (state === "done" || state === "failed" || state === "review") return; // stop polling
+      timer.current = window.setTimeout(tick, intervalMs);
+    };
 
-/* ---------- Progress ---------- */
-.rv-progress-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-.rv-progress h3 { margin: 0; font-size: 17px; }
-.rv-badge { padding: 5px 12px; border-radius: 999px; font-size: 12.5px; font-weight: 600; }
-.rv-badge.is-queued { background: #f1efec; color: #6b6b6b; }
-.rv-badge.is-running { background: #fdf0e9; color: #b8441a; }
-.rv-badge.is-review { background: #fdf0e9; color: #b8441a; }
-.rv-badge.is-done { background: #e8f5ec; color: #1e7a3c; }
-.rv-badge.is-failed { background: #fdecea; color: #c0362c; }
+    tick();
+    return () => {
+      cancelled = true;
+      if (timer.current) window.clearTimeout(timer.current);
+    };
+  }, [fetchJob, intervalMs, pollKey]);
 
-.rv-bar-row { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
-.rv-bar { flex: 1; height: 10px; border-radius: 999px; background: #ebe7e1; overflow: hidden; }
-.rv-bar-fill { height: 100%; border-radius: inherit; background: var(--msf-orange, #d9541e); transition: width 0.6s ease; }
-.rv-progress.is-running .rv-bar-fill {
-  background-image: linear-gradient(45deg, rgba(255,255,255,.22) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.22) 50%, rgba(255,255,255,.22) 75%, transparent 75%);
-  background-size: 18px 18px;
-  animation: rv-stripes 0.8s linear infinite;
-}
-@keyframes rv-stripes { to { background-position: 18px 0; } }
-.rv-pct { font-weight: 700; min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; }
-.rv-message { margin: 12px 0 0; font-size: 14px; line-height: 1.5; }
-.rv-log {
-  list-style: none;
-  margin: 10px 0 0;
-  padding-left: 12px;
-  border-left: 2px solid var(--msf-border, #e6e1da);
-  display: grid;
-  gap: 4px;
-  font-size: 12.5px;
-  color: var(--msf-muted, #6b6b6b);
-}
-
-/* ---------- Result ---------- */
-.rv-result h3 { margin: 6px 0 0; font-size: 20px; }
-.rv-result.is-done { border-left: 6px solid #1e7a3c; }
-.rv-result.is-failed { border-left: 6px solid #c0362c; }
-.rv-result.is-failed p { color: #c0362c; }
-.rv-result .rv-hint { margin-top: 10px; }
-
-/* ---------- Summary ---------- */
-.rv-summary {
-  position: relative;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 24px;
-  padding: 24px 28px;
-  border-radius: 14px;
-  background: var(--msf-black, #111);
-  color: #fff;
-  overflow: hidden;
-}
-.rv-summary::before {
-  content: "";
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 6px;
-  background: var(--msf-orange, #d9541e);
-}
-.rv-summary h2 { margin: 6px 0 4px; font-size: 22px; }
-.rv-request { margin: 0; color: #c9c9c9; font-size: 14px; font-style: italic; max-width: 60ch; }
-.rv-stats { display: flex; gap: 22px; flex: none; }
-.rv-stats div { display: grid; text-align: right; }
-.rv-stats strong { font-size: 22px; font-variant-numeric: tabular-nums; }
-.rv-stats .rv-add { color: #7fd69a; }
-.rv-stats .rv-del { color: #ff8f84; }
-.rv-stats span { font-size: 12px; color: #a8a8a8; }
-
-.rv-agent-summary { padding: 14px 20px; }
-.rv-agent-summary summary { cursor: pointer; font-weight: 600; font-size: 14px; }
-.rv-agent-summary pre {
-  margin: 12px 0 0;
-  white-space: pre-wrap;
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 13px;
-  line-height: 1.55;
-}
-
-/* ---------- Toolbar ---------- */
-.rv-toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  font-size: 14px;
-}
-.rv-toolbar > div { display: flex; gap: 14px; }
-.rv-link {
-  border: 0;
-  background: none;
-  padding: 0;
-  font: inherit;
-  font-size: 13px;
-  color: var(--msf-orange-dark, #b8441a);
-  cursor: pointer;
-}
-
-/* ---------- Files & hunks ---------- */
-.rv-file {
-  background: #fff;
-  border: 1px solid var(--msf-border, #e6e1da);
-  border-radius: 12px;
-  overflow: hidden;
-}
-.rv-file-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  background: var(--msf-cream, #fbf8f4);
-  border-bottom: 1px solid var(--msf-border, #e6e1da);
-  cursor: pointer;
-  user-select: none;
-}
-.rv-caret { color: var(--msf-muted, #6b6b6b); width: 12px; }
-.rv-path { font-size: 13.5px; font-weight: 600; word-break: break-all; }
-.rv-tag {
-  padding: 1px 8px;
-  border-radius: 999px;
-  font-size: 11.5px;
-  background: #f1efec;
-  color: #6b6b6b;
-}
-.rv-tag.is-new { background: #e8f5ec; color: #1e7a3c; }
-.rv-tag.is-del { background: #fdecea; color: #c0362c; }
-.rv-counts { margin-left: auto; font-size: 13px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-
-.rv-check { width: 17px; height: 17px; accent-color: var(--msf-orange, #d9541e); cursor: pointer; flex: none; }
-
-.rv-hunk { border-top: 1px solid var(--msf-border, #e6e1da); }
-.rv-hunk:first-of-type { border-top: 0; }
-.rv-hunk-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 14px;
-  background: #f3f0fa;
-  color: #5a4a8a;
-  font-size: 12.5px;
-}
-.rv-hunk-id { margin-left: auto; color: #8a80a8; }
-.rv-hunk.is-off .rv-lines { opacity: 0.4; }
-.rv-hunk.is-off .rv-hunk-head { background: #f4f4f4; color: #999; }
-
-.rv-lines {
-  width: 100%;
-  border-collapse: collapse;
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 12.5px;
-  line-height: 1.55;
-  table-layout: fixed;
-}
-.rv-lines td { padding: 0 8px; vertical-align: top; }
-.rv-no { width: 44px; text-align: right; color: #aaa; user-select: none; }
-.rv-sign { width: 14px; user-select: none; }
-.rv-code { white-space: pre-wrap; word-break: break-all; }
-.rv-lines tr.is-add { background: #e9f7ee; }
-.rv-lines tr.is-add .rv-sign { color: #1e7a3c; }
-.rv-lines tr.is-del { background: #fdeeed; }
-.rv-lines tr.is-del .rv-sign { color: #c0362c; }
-.rv-lines tr.is-meta td { color: #999; font-style: italic; }
-
-/* ---------- Footer ---------- */
-.rv-footer {
-  position: sticky;
-  bottom: 16px;
-  display: grid;
-  gap: 10px;
-  padding: 16px 22px;
-  background: #fff;
-  border: 1px solid var(--msf-border, #e6e1da);
-  border-radius: 14px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
-}
-.rv-actions { display: flex; justify-content: flex-end; gap: 12px; flex-wrap: wrap; margin-top: 6px; }
-.rv-footer .rv-actions { margin-top: 0; }
-
-.rv-btn {
-  height: 44px;
-  padding: 0 22px;
-  border: 0;
-  border-radius: 10px;
-  background: var(--msf-orange, #d9541e);
-  color: #fff;
-  font-size: 14.5px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.rv-btn:hover:not(:disabled) { background: var(--msf-orange-dark, #b8441a); }
-.rv-btn:disabled { background: #e4b8a5; cursor: not-allowed; }
-.rv-btn.is-danger { background: #fff; color: #c0362c; border: 1.5px solid #f3c3be; }
-.rv-btn.is-danger:hover:not(:disabled) { background: #fdecea; }
-.rv-btn.is-danger:disabled { color: #ddd; border-color: #eee; background: #fff; }
-
-@media (max-width: 760px) {
-  .rv-summary { flex-direction: column; align-items: flex-start; }
-  .rv-stats div { text-align: left; }
-  .rv-no { width: 32px; }
+  return { job, error, history, refresh: fetchJob };
 }
