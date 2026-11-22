@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 // Keep your existing import paths for these two:
 import MainLayout from "../layouts/MainLayout";
 import WorkflowNav from "../components/WorkflowNav";
-import { Job, jobState } from "../hooks/useJobPolling";
+import { Job, jobState, useJobPolling } from "../hooks/useJobPolling";
 import "./ApprovalPage.css";
 
 const API = import.meta.env.VITE_API_BASE_URL;
@@ -31,6 +31,15 @@ export const ApprovalPage: React.FC = () => {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  // The code job being tracked lives in the URL (?codeJob=<id>) so a refresh keeps tracking it
+  const [searchParams, setSearchParams] = useSearchParams();
+  const codeJobId = searchParams.get("codeJob") ?? undefined;
+  const { job: codeJob, error: codeJobError, history } = useJobPolling(codeJobId, 4000);
+  const codeState = jobState(codeJob?.status);
+  const codePct = Math.max(0, Math.min(100, codeJob?.progress_percentage ?? 0));
+  const tracking = !!codeJobId;
+  const codeRunning = tracking && (codeState === "queued" || codeState === "running");
+
   useEffect(() => {
     if (!migrationId) return;
     let cancelled = false;
@@ -44,7 +53,7 @@ export const ApprovalPage: React.FC = () => {
   }, [migrationId]);
 
   const ready = !!job && jobState(job.status) === "done" && !!job.local_repo_path;
-  const canSubmit = ready && query.trim().length >= 10 && !submitting;
+  const canSubmit = ready && !tracking && query.trim().length >= 10 && !submitting;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -75,7 +84,7 @@ export const ApprovalPage: React.FC = () => {
         );
       }
       const created: Job = await res.json();
-      navigate(`/migration/${created.id}/upgrade`);
+      setSearchParams({ codeJob: String(created.id) }); // stay here and track it
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
@@ -89,7 +98,7 @@ export const ApprovalPage: React.FC = () => {
       subtitle="Describe the code change"
       stepNumber={4}
       totalSteps={5}
-      workflow={<WorkflowNav currentStep="approval" migrationId={migrationId} disabled={submitting} />}
+      workflow={<WorkflowNav currentStep="approval" migrationId={migrationId} disabled={submitting || codeRunning} />}
     >
       <div className="ap-wrap">
         {loadError && <div className="ap-alert">{loadError}</div>}
@@ -146,11 +155,11 @@ export const ApprovalPage: React.FC = () => {
                 id="query"
                 className="ap-textarea"
                 placeholder="e.g. Upgrade the app from React 17 to 18. Replace ReactDOM.render with createRoot and fix any type errors."
-                value={query}
+                value={tracking ? codeJob?.user_query ?? query : query}
                 onChange={(e) => setQuery(e.target.value)}
                 maxLength={MAX}
                 rows={8}
-                disabled={submitting}
+                disabled={submitting || tracking}
               />
               <div className="ap-row">
                 <span className="ap-hint">Be specific: versions, packages, files or patterns to change.</span>
@@ -161,7 +170,7 @@ export const ApprovalPage: React.FC = () => {
                 <span className="ap-hint">Examples</span>
                 <div>
                   {EXAMPLES.map((ex) => (
-                    <button key={ex} type="button" className="ap-chip" onClick={() => setQuery(ex)} disabled={submitting}>
+                    <button key={ex} type="button" className="ap-chip" onClick={() => setQuery(ex)} disabled={submitting || tracking}>
                       {ex}
                     </button>
                   ))}
@@ -170,14 +179,72 @@ export const ApprovalPage: React.FC = () => {
 
               {submitError && <div className="ap-alert">{submitError}</div>}
 
-              <div className="ap-actions">
-                <button type="button" className="ap-btn is-secondary" onClick={() => navigate(`/migration/${job.id}/assessment`)} disabled={submitting}>
-                  ← Back
-                </button>
-                <button type="submit" className="ap-btn" disabled={!canSubmit}>
-                  {submitting ? "Submitting…" : "Submit code change →"}
-                </button>
-              </div>
+              {!tracking && (
+                <div className="ap-actions">
+                  <button type="button" className="ap-btn is-secondary" onClick={() => navigate(`/migration/${job.id}/assessment`)} disabled={submitting}>
+                    ← Back
+                  </button>
+                  <button type="submit" className="ap-btn" disabled={!canSubmit}>
+                    {submitting ? "Submitting…" : "Submit code change →"}
+                  </button>
+                </div>
+              )}
+
+              {/* ---------- Code job progress ---------- */}
+              {tracking && (
+                <div className={`ap-progress is-${codeState}`} aria-live="polite">
+                  <div className="ap-progress-top">
+                    <div>
+                      <span className="ap-hint">Code job</span>
+                      <div className="mono ap-jobid">{codeJobId}</div>
+                    </div>
+                    <span className={`ap-badge is-${codeState}`}>
+                      {codeRunning && <span className="ap-dot" />}
+                      {{ queued: "Queued", running: "Coding", done: "Completed", failed: "Failed" }[codeState]}
+                    </span>
+                  </div>
+
+                  <div className="ap-bar-row">
+                    <div className="ap-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={codePct}>
+                      <div className="ap-bar-fill" style={{ width: `${codePct}%` }} />
+                    </div>
+                    <span className="ap-pct">{codePct}%</span>
+                  </div>
+
+                  <p className="ap-message">
+                    {codeJobError && !codeJob
+                      ? codeJobError
+                      : codeJob?.progress_message ||
+                        (codeState === "queued" ? "Waiting for the worker to pick up this job…" : "Working…")}
+                  </p>
+
+                  {history.length > 1 && (
+                    <ol className="ap-log">
+                      {history.slice(0, -1).reverse().slice(0, 5).map((h, i) => (
+                        <li key={`${h.at}-${i}`}>{h.message}</li>
+                      ))}
+                    </ol>
+                  )}
+
+                  <div className="ap-actions">
+                    {codeState === "failed" ? (
+                      <button type="button" className="ap-btn is-secondary" onClick={() => setSearchParams({})}>
+                        Edit request and retry
+                      </button>
+                    ) : (
+                      <span className="ap-hint">{codeRunning ? "Refreshing every 4 seconds" : ""}</span>
+                    )}
+                    <button
+                      type="button"
+                      className="ap-btn"
+                      disabled={codeState !== "done"}
+                      onClick={() => navigate(`/migration/${codeJobId}/upgrade`)}
+                    >
+                      Continue to Validation →
+                    </button>
+                  </div>
+                </div>
+              )}
             </form>
           </section>
         )}
@@ -187,6 +254,7 @@ export const ApprovalPage: React.FC = () => {
 };
 
 export default ApprovalPage;
+
 
 
 /* Approval page — uses the --msf-* variables from SourcePage.css */
@@ -347,107 +415,159 @@ export default ApprovalPage;
 .ap-btn.is-secondary:hover:not(:disabled) { border-color: var(--msf-orange, #d9541e); background: #fff; }
 .ap-btn.is-secondary:disabled { background: #fff; color: #aaa; }
 
+/* ---------- Code job progress ---------- */
+.ap-progress {
+  margin-top: 24px;
+  padding: 18px 20px;
+  border-radius: 12px;
+  border: 1px solid var(--msf-border, #e6e1da);
+  background: var(--msf-cream, #fbf8f4);
+}
+.ap-progress.is-failed { background: #fdf6f5; border-color: #f3c3be; }
+
+.ap-progress-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.ap-jobid { font-size: 12.5px; margin-top: 2px; word-break: break-all; }
+
+.ap-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.ap-badge.is-queued { background: #f1efec; color: #6b6b6b; }
+.ap-badge.is-running { background: #fdf0e9; color: #b8441a; }
+.ap-badge.is-done { background: #e8f5ec; color: #1e7a3c; }
+.ap-badge.is-failed { background: #fdecea; color: #c0362c; }
+.ap-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: currentColor;
+  animation: ap-pulse 1.2s ease-in-out infinite;
+}
+@keyframes ap-pulse { 50% { opacity: 0.3; } }
+
+.ap-bar-row { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+.ap-bar { flex: 1; height: 10px; border-radius: 999px; background: #ebe7e1; overflow: hidden; }
+.ap-bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--msf-orange, #d9541e);
+  transition: width 0.6s ease;
+}
+.ap-progress.is-running .ap-bar-fill {
+  background-image: linear-gradient(45deg, rgba(255,255,255,.22) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.22) 50%, rgba(255,255,255,.22) 75%, transparent 75%);
+  background-size: 18px 18px;
+  animation: ap-stripes 0.8s linear infinite;
+}
+.ap-progress.is-done .ap-bar-fill { background: #1e7a3c; }
+.ap-progress.is-failed .ap-bar-fill { background: #c0362c; }
+@keyframes ap-stripes { to { background-position: 18px 0; } }
+.ap-pct { font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; min-width: 42px; text-align: right; }
+
+.ap-message { margin: 12px 0 0; font-size: 14px; line-height: 1.5; }
+.ap-progress.is-failed .ap-message { color: #c0362c; }
+
+.ap-log {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0 0 0 12px;
+  border-left: 2px solid var(--msf-border, #e6e1da);
+  display: grid;
+  gap: 4px;
+  font-size: 12.5px;
+  color: var(--msf-muted, #6b6b6b);
+}
+
+.ap-progress .ap-actions { margin-top: 18px; align-items: center; }
+
 @media (max-width: 900px) {
   .ap-card { grid-template-columns: 1fr; }
   .ap-context, .ap-form { padding: 26px 22px; }
 }
 
 
-# ===========================================================================
-# 1) API  —  app/app/schemas/job.py
-#    New optional fields on create; return them on read so the UI can copy them.
-# ===========================================================================
-from pydantic import BaseModel, Field
 
+import { useCallback, useEffect, useRef, useState } from "react";
 
-class JobCreate(BaseModel):
-    project_name: str = Field(min_length=1, max_length=255)
-    repository_url: str = Field(min_length=1, max_length=500)
-    branch: str = "main"
-    description: str | None = None
-    # new / now optional on create
-    job_type: str = "skill"                 # "skill" | "code"
-    user_query: str | None = None
-    local_repo_path: str | None = None
-    output_path: str | None = None
+export type Job = {
+  id: string;
+  project_name: string;
+  repository_url: string;
+  branch?: string | null;
+  description?: string | null;
+  progress_percentage: number | null;
+  status: string;
+  job_type?: string | null;
+  user_query?: string | null;
+  progress_message?: string | null;
+  created_at: string;
+  updated_at: string;
+};
 
+const DONE = ["completed", "complete", "success", "succeeded", "done"];
+const FAILED = ["failed", "error", "cancelled", "canceled"];
 
-class JobRead(BaseModel):                   # add the two new fields to your existing read schema
-    # ...existing fields...
-    local_repo_path: str | None = None
-    output_path: str | None = None
+export const jobState = (status?: string) => {
+  const s = (status ?? "").toLowerCase();
+  if (DONE.includes(s)) return "done" as const;
+  if (FAILED.includes(s)) return "failed" as const;
+  if (["pending", "queued", "created", "new"].includes(s)) return "queued" as const;
+  return "running" as const;
+};
 
-    model_config = {"from_attributes": True}
+/** Fetches GET /jobs/{id} every `intervalMs` until the job completes or fails. */
+export function useJobPolling(jobId?: string, intervalMs = 4000) {
+  const [job, setJob] = useState<Job | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [history, setHistory] = useState<{ at: string; message: string }[]>([]);
+  const timer = useRef<number | null>(null);
 
+  const fetchJob = useCallback(async () => {
+    if (!jobId) return null;
+    try {
+      // Adjust the path if your API uses a different one
+      const res = await fetch(`${import.meta.env.VITE_API_BASE_URL}/jobs/${jobId}`);
+      if (!res.ok) throw new Error(`Could not load job (${res.status})`);
+      const data: Job = await res.json();
+      setJob(data);
+      setError(null);
+      if (data.progress_message) {
+        setHistory((h) =>
+          h.length && h[h.length - 1].message === data.progress_message
+            ? h
+            : [...h, { at: data.updated_at, message: data.progress_message! }]
+        );
+      }
+      return data;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load job");
+      return null;
+    }
+  }, [jobId]);
 
-# In your create service / repository: never trust status from the client.
-#     job = Job(**payload.model_dump(), status="queued", progress_percentage=0)
-#
-# Optional validation in the create endpoint:
-#     if payload.job_type == "code" and not (payload.user_query and payload.local_repo_path):
-#         raise HTTPException(422, "Code jobs need user_query and local_repo_path")
+  useEffect(() => {
+    if (!jobId) return; // nothing to track yet
+    let cancelled = false;
+    setJob(null);
+    setHistory([]);
 
+    const tick = async () => {
+      const data = await fetchJob();
+      if (cancelled) return;
+      const state = jobState(data?.status);
+      if (state === "done" || state === "failed") return; // stop polling
+      timer.current = window.setTimeout(tick, intervalMs);
+    };
 
-# ===========================================================================
-# 2) WORKER  —  backend/job_worker/mainworker.py
-#    Replace build_query() and the "# 3. result" block.
-# ===========================================================================
-from pathlib import Path
+    tick();
+    return () => {
+      cancelled = true;
+      if (timer.current) window.clearTimeout(timer.current);
+    };
+  }, [fetchJob, intervalMs]);
 
-CODE_JOB_TYPES = {"code"}
-
-# Static instruction that makes the planner pick the coder agent only
-CODER_INSTRUCTION = (
-    "Run only the coder_agent. Do not generate or update skills. "
-    "Apply the change request below to the repository and produce a diff."
-)
-
-
-def is_code_job(job) -> bool:
-    return (job.job_type or "").lower() in CODE_JOB_TYPES
-
-
-def build_query(job, repo_path: Path) -> str:
-    if is_code_job(job):
-        lines = [CODER_INSTRUCTION, f"Repository path: {repo_path}"]
-        if job.output_path:
-            lines.append(f"Use the repository skill at: {Path(job.output_path) / 'repository_skill.md'}")
-        lines.append(f"Change request: {job.user_query}")
-        return "\n".join(lines)
-
-    # skill job (unchanged)
-    query = f"create skills using this path {repo_path}"
-    if job.user_query:
-        query += f". {job.user_query}"
-    return query
-
-
-# --- inside process_job(), at the very top of the try: block ----------------
-#     if is_code_job(job) and not job.user_query:
-#         raise ValueError("Code job has no change request (user_query is empty)")
-#
-# (local_repo_path is already set on code jobs, so the git fetch step is skipped)
-
-
-# --- replace the "# 3. result" block ----------------------------------------
-#     agent_status = str(response.status).lower()
-#     result = response.result
-#
-#     if is_code_job(job):
-#         coder = getattr(result, "coder", None) if result else None
-#         output_path = getattr(coder, "output_dir", None) or getattr(coder, "diff_path", None)
-#     else:
-#         skill = getattr(result, "skill", None) if result else None
-#         output_path = skill.output_dir if skill else None
-#
-#     if agent_status in SUCCESS_AGENT_STATUSES:
-#         update_job(
-#             job_id,
-#             status=COMPLETED,
-#             progress_percentage=100,
-#             progress_message="Completed",
-#             output_path=str(output_path) if output_path else job.output_path,
-#         )
-#     else:
-#         update_job(job_id, status=FAILED, progress_message=f"Agent stopped: {agent_status}")
-
+  return { job, error, history, refresh: fetchJob };
+}
